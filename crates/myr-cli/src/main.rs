@@ -137,22 +137,30 @@ fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             repository,
             root,
             prepare_only,
-        } => {
+        } => 'run: {
             if root.exists() {
                 return Err("run output store must be a new directory".into());
             }
-            let mission = myr_runner::mission::parse(&read_config(&mission)?)?;
+            let mission_bytes = read_config(&mission)?;
+            let mission = match myr_runner::mission::parse(&mission_bytes) {
+                Ok(mission) => mission,
+                Err(myr_runner::Error::Validation(_)) => {
+                    let mut graph = create_run_store(&root)?;
+                    let audit = myr_cas::Store::open(root.join("private-audit"))?;
+                    let rejected =
+                        myr_runner::admission::reject_mission(&mut graph, &audit, &mission_bytes)?;
+                    let mut value = serde_json::to_value(rejected.report)?;
+                    value["private_record"] = serde_json::to_value(rejected.private_record)?;
+                    std::fs::write(root.join("result.json"), serde_json::to_vec_pretty(&value)?)?;
+                    mission_failed = true;
+                    break 'run value;
+                }
+                Err(error) => return Err(error.into()),
+            };
             let config: myr_runner::setup::Config = serde_json::from_slice(&read_config(&config)?)?;
             config.validate(&mission)?;
             let tree = myr_runner::snapshot::read(&repository, &config.read_policy)?;
-            if let Some(parent) = root.parent().filter(|p| !p.as_os_str().is_empty()) {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::create_dir(&root)?;
-            let mut graph = Graph::open(
-                root.join("graph.sqlite"),
-                myr_cas::Store::open(root.join("objects"))?,
-            )?;
+            let mut graph = create_run_store(&root)?;
             let mut prepared = myr_runner::setup::prepare(
                 &mut graph,
                 &mission,
@@ -295,6 +303,17 @@ fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     Ok(())
+}
+
+fn create_run_store(root: &Path) -> Result<Graph, Box<dyn std::error::Error>> {
+    if let Some(parent) = root.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::create_dir(root)?;
+    Ok(Graph::open(
+        root.join("graph.sqlite"),
+        myr_cas::Store::open(root.join("objects"))?,
+    )?)
 }
 
 fn read_config(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {

@@ -15,8 +15,15 @@ Updated: 2026-09-24. Goal remains active and incomplete.
   the fixture pilot, sealed goal/task execution components, budgets and accounting; CLI implements `run`, `pilot`, `show`, `invalidate`, `seal`, `inspect-goal`, `check-mission`, and `snapshot`.
 - The published baseline passed **140 Windows tests**. These include context/schema
   accounting, journaled dispatch, task execution, and sealed role/model/billing enforcement.
-- The full offline suite now passes **142 Windows tests**, including interrupted
-  task-output retention. Formatting and all-target Clippy also pass.
+- The full offline suite now passes **144 Windows tests**, including interrupted
+  task-output retention and invalid mission admission. Formatting and all-target
+  Clippy also pass.
+- Input admission now records INVALID_GOAL for malformed mission YAML and input
+  contract violations, with exact original bytes, runtime FAIL, dependency closure,
+  zero model usage and a private immutable report. CLI tests cover invalid UTF-8,
+  schema/path/command errors, the mission size bound, prepare-only, no overwrite,
+  unreadable-input separation and no configuration/repository access. Library tests
+  reject attempts to label valid or ambiguous prose invalid. UNSAT remains open.
 - Coverage includes CLI measurement configuration, schedule/collection and
   CAS context provenance. Procedure setup, pre-store
   validation and goal compilation now reject malformed or unsealed measurement
@@ -193,7 +200,7 @@ Updated: 2026-09-24. Goal remains active and incomplete.
 | Baseline + DELTA reconstruction, deterministic sandbox | Exact reconstruction, candidate provenance, Docker execution and runtime command/measurement EVIDENCE implemented; live confinement and native backends pending |
 | Both DELTA codecs | Runner applies full replacement and exact single-file unified diff; opaque bytes and newline behavior tested. Adapter exposes both codecs with task-local patch/result references; live mission integration pending |
 | Fixed planner/worker/two-reviewer pipeline | Prepared-catalog planner/worker/command/two-reviewer coordination, setup and CLI implemented with one budget and journal; injected tests pass; live acceptance pending |
-| Five terminal states with truthful evidence | Post-seal COMPLETE/COMPLETE_WITH_ASSUMPTIONS/PARTIAL uses candidate-bound facts and completed stages; INVALID_GOAL reporting and evidence-backed UNSAT remain pending |
+| Five terminal states with truthful evidence | Post-seal COMPLETE/COMPLETE_WITH_ASSUMPTIONS/PARTIAL uses candidate-bound facts and completed stages; input-admission INVALID_GOAL retains original bytes and validation provenance; evidence-backed UNSAT remains pending |
 | `myr run`, `show`, `invalidate` | Commands implemented; run preparation and offline failure path have binary tests; successful live mission acceptance remains pending |
 | Comparable prose baseline | Not implemented |
 | `token-accounting-v0`, cl100k_base, frozen renderer | Compact renderer, pinned cl100k_base tokenizer, per-segment/per-call ledger, CAS byte separation and implementation fingerprints implemented; exact context assembly and private audit retention tested; exact shared/protocol schema partition tested; budgeted transport dispatch tested with injected transport; concrete baseline schema, full role integration, differential tokenizer validation and manifest freeze pending |
@@ -209,8 +216,9 @@ Updated: 2026-09-24. Goal remains active and incomplete.
 1. Complete live provider/schema and sandbox-conformance acceptance. Claude Code
    has passed only a minimal finish smoke. Preserve explicit billing choice; do
    not inspect credentials or treat fixture/mock success as live evidence.
-2. Complete terminal INVALID_GOAL/UNSAT
-   handling, interruption recovery and candidate lifecycle behavior.
+2. Complete evidence-backed UNSAT handling, interruption recovery and candidate
+   lifecycle behavior; preserve the separation between invalid user inputs,
+   invalid planner outputs and infrastructure failures.
 3. Complete accounting, matched baseline, corpus checks, missing-data statistics, freezing,
    official runs, and report. Keep development evidence separate from official data.
 

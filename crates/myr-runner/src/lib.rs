@@ -2,6 +2,7 @@
 //! distinct from live-provider execution and official benchmark evidence.
 pub mod acceptance;
 pub mod accounting;
+pub mod admission;
 pub mod budget;
 pub mod candidate;
 pub mod collection;

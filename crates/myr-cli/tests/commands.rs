@@ -103,6 +103,103 @@ fn runtime_config(dir: &std::path::Path) -> serde_json::Value {
 }
 
 #[test]
+fn invalid_mission_admission_records_original_input_without_loading_config_or_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let mission = dir.path().join("mission.yaml");
+    let inputs = [
+        b"goal: x\nverify: []".to_vec(),
+        b"goal: [unterminated".to_vec(),
+        b"goal: x\nverify: [cargo test]\nextra: true".to_vec(),
+        b"goal: x\nverify: ['cargo test && echo success']".to_vec(),
+        b"goal: x\nverify: [cargo test]\nprotected: ['../outside']".to_vec(),
+        vec![255, 0, 254],
+        vec![b'x'; 1024 * 1024 + 1],
+    ];
+    for (index, bytes) in inputs.iter().enumerate() {
+        std::fs::write(&mission, bytes).unwrap();
+        let root = dir.path().join(format!("rejected-{index}"));
+        let mut command = myr();
+        command
+            .arg("run")
+            .arg(&mission)
+            .arg("--config")
+            .arg(dir.path().join("missing-config.json"))
+            .arg("--repository")
+            .arg(dir.path().join("missing-repository"))
+            .arg("--root")
+            .arg(&root);
+        if index % 2 == 0 {
+            command.arg("--prepare-only");
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["state"], "INVALID_GOAL");
+        assert_eq!(result["phase"], "admission");
+        assert_eq!(result["budget"]["calls_started"], 0);
+        assert_eq!(result["budget"]["input_reference_tokens"], 0);
+        assert_eq!(result["budget"]["output_reference_tokens"], 0);
+        assert_eq!(result["evidence"], serde_json::json!([]));
+        assert_eq!(result["active_assumptions"], serde_json::json!([]));
+        assert!(!root.join("prepared.json").exists());
+        let graph = Graph::open(
+            root.join("graph.sqlite"),
+            myr_cas::Store::open(root.join("objects")).unwrap(),
+        )
+        .unwrap();
+        let input: ObjectRef = serde_json::from_value(result["input"].clone()).unwrap();
+        assert_eq!(graph.cas().get(input).unwrap(), *bytes);
+        assert!(myr_runner::mission::parse(&graph.cas().get(input).unwrap()).is_err());
+        let failure: ObjectRef = serde_json::from_value(result["failure"].clone()).unwrap();
+        let Object::Fail(fail) = graph.get(failure).unwrap() else {
+            panic!()
+        };
+        assert_eq!(fail.code, FailCode::InvalidGoal);
+        assert_eq!(fail.class, FailClass::Goal);
+        assert_eq!(fail.task, None);
+        let provenance: Vec<ObjectRef> =
+            serde_json::from_value(result["provenance"].clone()).unwrap();
+        assert_eq!(provenance, graph.dependencies(failure).unwrap());
+        assert!(provenance.contains(&input));
+        let artifacts: Vec<ObjectRef> =
+            serde_json::from_value(result["artifacts"].clone()).unwrap();
+        assert!(artifacts.contains(&input) && artifacts.contains(&fail.diagnostic));
+        let private_record: ObjectRef =
+            serde_json::from_value(result["private_record"].clone()).unwrap();
+        assert!(graph.resolve(private_record.cid).is_err());
+        let audit = myr_cas::Store::open(root.join("private-audit")).unwrap();
+        let private: serde_json::Value =
+            serde_json::from_slice(&audit.get(private_record).unwrap()).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("result.json")).unwrap()).unwrap();
+        assert_eq!(saved, result);
+        let mut report = result;
+        report.as_object_mut().unwrap().remove("private_record");
+        assert_eq!(private, report);
+        assert_eq!(std::fs::read(&mission).unwrap(), *bytes);
+        // Repeating a rejected run must not overwrite its original evidence.
+        assert!(!command.output().unwrap().status.success());
+        let unchanged: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("result.json")).unwrap()).unwrap();
+        assert_eq!(unchanged, saved);
+    }
+    // An unreadable input is an I/O error, not evidence of an invalid goal.
+    let root = dir.path().join("unreadable-run");
+    let output = myr()
+        .arg("run")
+        .arg(dir.path().join("missing.yaml"))
+        .arg("--config")
+        .arg(dir.path().join("missing-config.json"))
+        .arg("--root")
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(!root.exists());
+}
+
+#[test]
 fn run_preparation_preserves_bytes_and_failed_execution_records_partial() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repository");

@@ -35,7 +35,8 @@ remaining live checks are documented in [transports](docs/transports.md).
 - Typed MW/0 messages, canonical encoding and BLAKE3 content identifiers.
 - Immutable filesystem storage and a SQLite dependency/evidence graph.
 - Claims, attestations, runtime evidence, promoted facts and invalidation.
-- YAML mission validation, a sealed Goal IR and protected paths.
+- YAML mission validation with auditable `INVALID_GOAL` reports, a sealed Goal IR
+  and protected paths.
 - A planner/worker/two-reviewer pipeline with shared call, token and time budgets.
 - Candidate reconstruction from full replacements or exact unified diffs.
 - Explicit Docker Linux verifier execution and scalar empirical measurements.

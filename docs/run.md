@@ -17,17 +17,33 @@ Execute with the explicitly configured providers:
 myr run myr.yaml --config runtime.json --repository path/to/repository --root path/to/new-run
 ```
 
-Each invocation requires a new output directory. Snapshot reading happens before
-that directory is created. Keep output stores outside the input repository, or
+Each invocation requires a new output directory. For an admitted mission,
+snapshot reading happens before that directory is created. Keep output stores outside the input repository, or
 exclude prior stores with `read_policy`, to avoid importing old run data. The
 source checkout is never edited; reconstructed result files remain available as
 CAS artifacts through the candidate manifest.
 
-`--prepare-only` writes `prepared.json`, a graph and shared CAS. It does not check
+For valid input, `--prepare-only` writes `prepared.json`, a graph and shared CAS. It does not check
 provider authentication, launch Docker, or prove configured tools exist. Execution
 adds private audit records and `result.json`. Completed/conditionally completed
-missions return exit code zero; PARTIAL returns a nonzero exit code after printing
+missions return exit code zero; PARTIAL and INVALID_GOAL return a nonzero exit code after printing
 and saving the result. Configuration or storage failures also return nonzero.
+
+An invalid mission YAML produces `INVALID_GOAL` with phase `admission`, including
+when `--prepare-only` is set. The result stores the exact submitted bytes, a
+runtime `FAIL` with code `INVALID_GOAL`, its parser/validation diagnostic and their
+dependency closure. It includes artifacts, empty evidence/active-assumption lists,
+zero model usage and an immutable private audit copy. Re-reading the input artifact
+with `mission::parse` reproduces the rejection. No Goal IR is sealed and no
+configuration, repository snapshot, model or command verifier is accessed.
+
+This admission verdict concerns the input contract: malformed YAML, empty required
+fields, unknown fields, unsafe command shorthand, invalid protected paths or the
+1 MiB mission limit. The CLI still enforces its 16 MiB read cap before admission;
+unreadable files, that read-cap failure and storage errors are I/O/preflight
+failures, without a terminal report. Runtime configuration errors are also kept
+separate. Ambiguous or contradictory-looking prose is not rejected by this gate;
+planner mistakes and provider/budget failures do not become INVALID_GOAL or UNSAT.
 
 ## Runtime configuration
 
@@ -85,8 +101,9 @@ includes the mission/policy input, baseline files, diagnostic and any objects
 created by the planner. Empty evidence means no evidence was produced, not that
 the requested obligations were verified. Post-seal reports expose the same four
 result fields; these are historical results, not a fresh liveness assessment.
-Live empirical measurement acceptance, evidence-backed UNSAT/INVALID_GOAL reporting,
-live acceptance, crash recovery and benchmark deliverables remain open.
+Input-admission INVALID_GOAL reporting is implemented. Evidence-backed UNSAT,
+live empirical/provider/sandbox acceptance, crash recovery and benchmark
+deliverables remain open.
 
 ## Exporting a candidate
 
