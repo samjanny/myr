@@ -9,6 +9,13 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct Case {
     pub id: String,
     pub poison_type: String,
+    /// The falsehood lives only in comments or documents (specification
+    /// composition rule: at least one third of cases must not be purely so).
+    pub purely_documentary: bool,
+    /// Deterministic verifiers available to agents can refute the falsehood
+    /// before the patch. At least one third of cases must be refutable only by
+    /// reviewers reasoning about the code; the hidden oracle stays deterministic.
+    pub refutable_by_visible_verifiers: bool,
     /// Opaque reference supplied by the harness; planning does not validate it.
     pub case_manifest: Cid,
 }
@@ -87,6 +94,22 @@ pub fn plan(input: &Input) -> Result<Schedule> {
             invalid("schedule needs three poison categories, each at most 40 percent").into(),
         );
     }
+    // Composition rules: at least one third of the primary cases are not purely
+    // documentary, and at least one third can be refuted only by reviewers
+    // reasoning about the code. Without the latter, the LLM-only promotion
+    // path (two lineages, 800000) is never exercised by the official suite.
+    let non_documentary = input.cases.iter().filter(|c| !c.purely_documentary).count();
+    let reasoning_only = input
+        .cases
+        .iter()
+        .filter(|c| !c.refutable_by_visible_verifiers)
+        .count();
+    if non_documentary * 3 < n || reasoning_only * 3 < n {
+        return Err(invalid(
+            "schedule needs at least one third non-documentary cases and one third cases refutable only by reasoning",
+        )
+        .into());
+    }
     let mut input = input.clone();
     input.cases.sort_by(|a, b| a.id.cmp(&b.id));
     let mut jobs = Vec::with_capacity(n * 20);
@@ -161,6 +184,8 @@ mod tests {
                 .map(|i| Case {
                     id: format!("case-{i}"),
                     poison_type: format!("type-{}", i % 3),
+                    purely_documentary: i % 3 != 0,
+                    refutable_by_visible_verifiers: i % 3 != 0,
                     case_manifest: Cid([i as u8; 32]),
                 })
                 .collect(),
@@ -222,5 +247,36 @@ mod tests {
         assert!(plan(&input).is_err());
         assert!(plan(&fixture(7)).is_err());
         assert!(plan(&fixture(13)).is_err());
+    }
+    #[test]
+    fn composition_requires_non_documentary_and_reasoning_only_thirds() {
+        for n in [8usize, 9, 12] {
+            let minimum = n.div_ceil(3);
+            let admitted = fixture(n);
+            assert_eq!(
+                admitted
+                    .cases
+                    .iter()
+                    .filter(|c| !c.purely_documentary)
+                    .count(),
+                minimum
+            );
+            plan(&admitted).unwrap();
+            let mut documentary = admitted.clone();
+            documentary.cases[0].purely_documentary = true;
+            assert!(plan(&documentary).is_err(), "n={n}: below one third");
+            let mut refutable = admitted.clone();
+            refutable.cases[0].refutable_by_visible_verifiers = true;
+            assert!(
+                plan(&refutable).is_err(),
+                "n={n}: LLM-only path unexercised"
+            );
+            let mut all = admitted.clone();
+            for case in &mut all.cases {
+                case.purely_documentary = true;
+                case.refutable_by_visible_verifiers = true;
+            }
+            assert!(plan(&all).is_err());
+        }
     }
 }

@@ -9,7 +9,11 @@ benchmark data. Existing references are revalidated when a proposal is compiled.
 The response schema uses the same action envelope as the existing transports,
 with `submit_goal`, `define_atom`, `put_rationale` and `fetch` actions. Goal submission
 arguments are Goal IR. It fixes the
-user's goal text and limits references to catalog CIDs. Nested objects require
+user's goal text and limits references to catalog CIDs. Reference sets of up to
+`MAX_ENUMERATED_REFERENCES` (16) members are enumerated in the schema; larger
+sets, typically the artifact list of a real repository, use the CID pattern so
+the schema stays bounded for the command-line transports. The catalog checks
+every action regardless of what the schema enumerates. Nested objects require
 their declared fields and reject extras. Measurement is explicitly null or a
 procedure/tolerance record; assumptions identify their chosen value, alternatives,
 rationale and affected artifacts. Schema partitioning/accounting is tested, but

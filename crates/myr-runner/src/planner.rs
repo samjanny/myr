@@ -11,6 +11,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
+/// Reference sets up to this size are enumerated in the planner schema; larger
+/// sets use the CID pattern so the schema stays bounded for big repositories.
+/// Access control never depends on the schema: the catalog checks every action.
+pub const MAX_ENUMERATED_REFERENCES: usize = 16;
+
 pub struct Catalog {
     registry: BTreeSet<ObjectRef>,
     atoms: BTreeSet<ObjectRef>,
@@ -68,7 +73,7 @@ fn record(properties: Value) -> Value {
     json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
 }
 fn references(kind: Kind, allowed: &BTreeSet<ObjectRef>) -> Value {
-    let cid = if allowed.is_empty() {
+    let cid = if allowed.is_empty() || allowed.len() > MAX_ENUMERATED_REFERENCES {
         json!({"type":"string","pattern":"^b3:[0-9a-f]{64}$"})
     } else {
         json!({"type":"string","enum":allowed.iter().map(|r| r.cid.to_string()).collect::<Vec<_>>()})
@@ -338,5 +343,54 @@ impl Catalog {
             return Err(invalid("planner proposal references objects outside its catalog").into());
         }
         mission::compile(graph, mission, ir, policy)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{goal, mission::Mission};
+
+    #[test]
+    fn large_catalogs_keep_the_planner_schema_bounded() {
+        let mut f = crate::command_verification::tests::Fixture::new(true);
+        let sealed = goal::load(&f.graph, f.goal).unwrap();
+        let mission = Mission {
+            goal: sealed.ir().goal.clone(),
+            verify: vec![vec!["check".into()]],
+            protected: vec![],
+        };
+        let mut artifacts = vec![f.policy];
+        for index in 0..MAX_ENUMERATED_REFERENCES {
+            artifacts.push(
+                f.graph
+                    .register_artifact(format!("file {index}").as_bytes())
+                    .unwrap(),
+            );
+        }
+        let small = Catalog::new(
+            &f.graph,
+            &sealed.ir().registry,
+            &[f.atom],
+            &artifacts[..MAX_ENUMERATED_REFERENCES],
+        )
+        .unwrap();
+        let enumerated = small.response_schema(&mission).to_string();
+        assert!(enumerated.contains(&f.policy.cid.to_string()));
+        let large = Catalog::new(&f.graph, &sealed.ir().registry, &[f.atom], &artifacts).unwrap();
+        let bounded = large.response_schema(&mission).to_string();
+        assert!(!bounded.contains(&artifacts[1].cid.to_string()));
+        assert!(bounded.contains(&f.atom.cid.to_string()));
+        // Claude Code passes the schema on the command line; keep it well below
+        // that transport's documented limit even for repositories with many files.
+        for index in 0..2000 {
+            artifacts.push(
+                f.graph
+                    .register_artifact(format!("large file {index}").as_bytes())
+                    .unwrap(),
+            );
+        }
+        let huge = Catalog::new(&f.graph, &sealed.ir().registry, &[f.atom], &artifacts).unwrap();
+        assert!(huge.response_schema(&mission).to_string().len() < 8000);
     }
 }

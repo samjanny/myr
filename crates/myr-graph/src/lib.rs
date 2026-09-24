@@ -228,6 +228,21 @@ impl Graph {
             .transpose()
     }
 
+    /// Live EVIDENCE objects indexed for one CLAIM, in canonical order. Evidence
+    /// on the opposite-polarity CLAIM must be queried separately by the caller.
+    pub fn live_evidence(&self, claim: ObjectRef) -> Result<Vec<ObjectRef>> {
+        claim.require(Kind::Claim)?;
+        let mut stmt = self.connection.prepare(
+            "SELECT e.cid FROM evidence e JOIN nodes n ON n.cid=e.cid WHERE e.claim=?1 AND n.active=1 AND n.stale=0 ORDER BY e.cid",
+        )?;
+        let ids = stmt
+            .query_map([claim.cid.to_string()], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| Ok(ObjectRef::new(Kind::Evidence, id.parse()?)))
+            .collect()
+    }
+
     /// Runtime inspection of dependency provenance, including the root. This is
     /// not agent access authorization; agents must continue using `fetch`.
     /// Historical dependencies remain visible so callers can diagnose staleness.

@@ -10,7 +10,8 @@ fn myr() -> Command {
 fn benchmark_plan_is_reproducible_and_does_not_execute_jobs() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("schedule-input.json");
-    let cases:Vec<_> = (0..8).map(|i| serde_json::json!({"id":format!("case-{i}"),"poison_type":format!("type-{}",i%3),"case_manifest":Cid([i;32])})).collect();
+    let cases:Vec<_> = (0..8).map(|i| serde_json::json!({"id":format!("case-{i}"),"poison_type":format!("type-{}",i%3),
+        "purely_documentary":i%3!=0,"refutable_by_visible_verifiers":i%3!=0,"case_manifest":Cid([i;32])})).collect();
     let input = serde_json::json!({"cases":cases,"configuration":Cid([99;32]),"seed":42});
     std::fs::write(&path, serde_json::to_vec(&input).unwrap()).unwrap();
     let first = myr().arg("plan-benchmark").arg(&path).output().unwrap();
@@ -712,7 +713,7 @@ fn pilot_and_show_work_through_the_public_binary() {
     let cid = report["runs"][3]["facts"][0]["cid"].as_str().unwrap();
     let shown = myr()
         .args(["show", cid, "--root"])
-        .arg(root.join("mw0-poisoned"))
+        .arg(root.join("ascii-fold-mw0-poisoned"))
         .output()
         .unwrap();
     assert!(

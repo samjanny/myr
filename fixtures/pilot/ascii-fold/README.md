@@ -23,3 +23,7 @@ only promoted information. Two fixture reviewers compare the source assertion
 with the clean implementation. They are simulated reviewers, not provider calls.
 Their runtime-issued evidence explicitly identifies fixture lineages. These runs
 exercise plumbing, isolation, and policy, and cannot establish Myr's effectiveness.
+
+This case is purely documentary and refutable by a deterministic test on the
+clean code, the kind the specification limits in the primary condition. The
+companion `padded-id` fixture is refutable only by reasoning.

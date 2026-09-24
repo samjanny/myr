@@ -4,13 +4,19 @@
 provider transports and can consume subscription quota or paid API usage. It is
 not an inspection operation. `myr run` connects preparation, planning and this pipeline.
 
-Given an existing valid compiler seal, instruction references, writable paths and
-selected unresolved decisions, it issues a worker TASK, processes its action loop,
+Given an existing valid compiler seal, instruction references and writable paths,
+it issues a worker TASK, processes its action loop,
 reconstructs its DELTAs into a recorded candidate, executes sealed command criteria,
 then issues two fresh reviewer TASKs for the same candidate. Both reviewer slots
 use the provider/model/billing selection fixed by the goal seal. Each reviewer
 must produce bound EVIDENCE for every binding CLAIM and finish its task. A bare
 `finish` is insufficient. No agent receives another agent's conversation history.
+
+The worker TASK depends on every pending assumption sealed in the Goal IR: those
+choices materialize as ASSUMPTION objects when the worker is issued, because the
+worker produces the artifacts they affect. Its inputs also include the sealed
+predicate registry, so `emit_claim` can use any registered predicate; the rest
+of its reference closure comes from the scope (baseline files) and obligations.
 
 Standalone `run_sealed` owns a new dispatcher. `run_continuing` instead borrows
 the planner's existing dispatcher and rejects expanded limits, a changed audit
@@ -31,10 +37,21 @@ invoking this coordinator.
 The result is COMPLETE only when all three agent stages finish, both reviews cover
 every binding claim, no execution failure is recorded, the deadline holds, and
 candidate-bound acceptance proves every obligation. Materialized active assumptions
-produce COMPLETE_WITH_ASSUMPTIONS. Other outcomes are PARTIAL. Tool failures and
-missing evidence never imply UNSAT. Invalid seals return errors before provider
-execution; INVALID_GOAL and evidence-backed UNSAT reports remain planner/compiler
-and terminal-orchestration work.
+produce COMPLETE_WITH_ASSUMPTIONS. Tool failures and missing evidence never imply
+UNSAT. Invalid seals return errors before provider execution; INVALID_GOAL is an
+input-admission report.
+
+UNSAT requires evidence of incompatible obligations. The pipeline recognizes one
+mechanically provable form: the sealed policy leaves no baseline path writable
+outside protected prefixes (DELTAs cannot create paths), so the sealed baseline
+is the only admissible candidate, and runtime deterministic EVIDENCE bound to
+that candidate contradicts a binding obligation. Appendix B.3 rule 1 makes such a
+refutation final, so the reviewers are not dispatched. The pipeline records a
+`CONFLICTING_OBLIGATIONS` FAIL whose diagnostic is a `myr-unsat-proof-v0`
+artifact depending on the candidate, the refuted atoms and the refuting evidence,
+and the report state is UNSAT. A refuted candidate that could have been different
+remains PARTIAL: no unsatisfiability follows from one failed attempt. Sandbox,
+provider and budget failures never produce this state.
 
 The private immutable report retains stage outputs, command evidence references,
 failures, acceptance, artifacts, active assumptions, provenance, budget usage and

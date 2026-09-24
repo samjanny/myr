@@ -19,7 +19,6 @@ pub struct Config {
     pub worker_instruction: ObjectRef,
     pub review_instruction: ObjectRef,
     pub writable: Vec<String>,
-    pub decisions: Vec<ObjectRef>,
     pub system: String,
     pub shared_schema: serde_json::Value,
     pub max_native_output_tokens: u32,
@@ -438,18 +437,23 @@ fn run_existing_with(
         .filter(|c| c.binding)
         .map(|c| c.atom)
         .collect();
+    // The worker produces the artifacts every sealed interpretive choice affects,
+    // so all pending assumptions materialize here, not earlier and not silently.
+    let decisions: Vec<_> = sealed.ir().assumptions.iter().map(|a| a.atom).collect();
     let worker = goal::issue_task(
         graph,
         goal_ref,
         goal::TaskDraft {
-            inputs: vec![],
+            // The sealed registry is the only predicate vocabulary the worker
+            // may use in claims; the rest of its closure comes from the scope.
+            inputs: sealed.ir().registry.clone(),
             capabilities: config
                 .writable
                 .iter()
                 .map(|p| format!("write:{p}"))
                 .collect(),
             obligations: obligations.clone(),
-            decisions: config.decisions.clone(),
+            decisions,
             instruction: config.worker_instruction,
         },
     )?;
@@ -543,6 +547,34 @@ fn run_existing_with(
                 .map_err(crate::Error::from)?,
         );
     }
+    // Evidence-backed UNSAT: when the sealed policy leaves no baseline path
+    // writable, the baseline is the only admissible candidate. Deterministic
+    // evidence contradicting a binding obligation on it proves the obligations
+    // incompatible (Appendix B.3 rule 1: no reviewer agreement can override D-).
+    if let Some(proof) = unsat_proof(graph, audit, &sealed, &candidate)? {
+        let diagnostic = graph
+            .register_artifact_with_dependencies(
+                &serde_json::to_vec(&proof).map_err(crate::Error::from)?,
+                &proof.dependencies(),
+            )
+            .map_err(crate::Error::from)?;
+        report.failures.push(
+            graph
+                .insert(
+                    Authority::Runtime,
+                    &Object::Fail(Fail {
+                        class: FailCode::ConflictingObligations.class(),
+                        code: FailCode::ConflictingObligations,
+                        diagnostic,
+                        task: None,
+                    }),
+                )
+                .map_err(crate::Error::from)?,
+        );
+        report.acceptance = Some(proof.acceptance);
+        report.state = MissionState::Unsat;
+        return finish(graph, audit, dispatcher, report, deadline);
+    }
     for slot in [RoleSlot::ReviewerA, RoleSlot::ReviewerB] {
         if remaining().is_zero() {
             fail(
@@ -626,6 +658,64 @@ fn run_existing_with(
         )?,
     }
     finish(graph, audit, dispatcher, report, deadline)
+}
+
+/// Machine-readable proof recorded as the CONFLICTING_OBLIGATIONS diagnostic.
+#[derive(Serialize)]
+struct UnsatProof {
+    format: String,
+    candidate: ObjectRef,
+    writable: Vec<String>,
+    protected: Vec<String>,
+    editable_paths: Vec<String>,
+    refuted: Vec<acceptance::Obligation>,
+    #[serde(skip)]
+    acceptance: acceptance::Acceptance,
+}
+
+impl UnsatProof {
+    fn dependencies(&self) -> Vec<ObjectRef> {
+        let mut dependencies = vec![self.candidate];
+        for obligation in &self.refuted {
+            dependencies.push(obligation.atom);
+            dependencies.extend(obligation.refuting_evidence.iter().copied());
+        }
+        dependencies.sort();
+        dependencies.dedup();
+        dependencies
+    }
+}
+
+fn unsat_proof(
+    graph: &Graph,
+    audit: &Store,
+    sealed: &goal::SealedGoal,
+    candidate: &candidate::RecordedCandidate,
+) -> Result<Option<UnsatProof>, Error> {
+    let manifest = candidate::load_manifest(graph, candidate.reference())?;
+    let editable_paths = manifest.editable_paths(&sealed.policy().protected);
+    if !editable_paths.is_empty() {
+        return Ok(None);
+    }
+    let assessment = acceptance::assess_candidate(graph, audit, candidate.reference())?;
+    if !assessment.refuted_by_deterministic_evidence() {
+        return Ok(None);
+    }
+    let refuted = assessment
+        .obligations
+        .iter()
+        .filter(|o| o.status == acceptance::ObligationStatus::Refuted)
+        .cloned()
+        .collect();
+    Ok(Some(UnsatProof {
+        format: "myr-unsat-proof-v0".into(),
+        candidate: candidate.reference(),
+        writable: manifest.writable,
+        protected: sealed.policy().protected.clone(),
+        editable_paths,
+        refuted,
+        acceptance: assessment,
+    }))
 }
 
 fn finish(
@@ -812,7 +902,7 @@ mod tests {
                 crate::docker_sandbox::Execution {
                     candidate: candidate.reference(),
                     policy: self.policy,
-                    exit_code: 0,
+                    exit_code: if self.mode == "refute" { 7 } else { 0 },
                     stdout: if self.mode == "empirical_success" || self.mode == "empirical_outside"
                     {
                         serde_json::to_vec(&crate::measurement::Observation {
@@ -849,7 +939,6 @@ mod tests {
             worker_instruction: instruction,
             review_instruction: instruction,
             writable: vec!["f".into()],
-            decisions: vec![],
             system: "Return Myr actions.".into(),
             shared_schema: myr_adapter::schema::response_schema(myr_adapter::Role::Worker),
             max_native_output_tokens: 1024,
@@ -1098,7 +1187,7 @@ mod tests {
     fn sealed_pipeline_runs_all_stages_and_keeps_conditional_completion_explicit() {
         for conditional in [false, true] {
             let mut f = Fixture::new(true);
-            let mut config = config(&mut f);
+            let config = config(&mut f);
             if conditional {
                 let sealed = goal::load(&f.graph, f.goal).unwrap();
                 let mut ir = sealed.ir().clone();
@@ -1138,7 +1227,6 @@ mod tests {
                 f.goal = goal::compile(&mut f.graph, ir, sealed.policy().clone())
                     .unwrap()
                     .reference();
-                config.decisions.push(atom);
             }
             let mut driver = Simulated {
                 mode: "success",
@@ -1154,6 +1242,28 @@ mod tests {
                     MissionState::Complete
                 }
             );
+            // Every pending assumption sealed in the Goal IR materializes when
+            // the worker task is issued: the worker depends on those choices.
+            let Object::Task(worker_task) = f.graph.get(outcome.report.stages[0].task).unwrap()
+            else {
+                unreachable!()
+            };
+            assert_eq!(worker_task.assumptions.len(), usize::from(conditional));
+            let sealed = goal::load(&f.graph, f.goal).unwrap();
+            for pending in &sealed.ir().assumptions {
+                assert!(worker_task.inputs.contains(&pending.atom));
+            }
+            // The worker may only use registered predicates, so every sealed
+            // registry entry must be inside its task reference closure.
+            assert!(!sealed.ir().registry.is_empty());
+            for predicate in &sealed.ir().registry {
+                assert!(worker_task.inputs.contains(predicate));
+                assert!(
+                    f.graph
+                        .fetch(&[outcome.report.stages[0].task], *predicate)
+                        .is_ok()
+                );
+            }
             assert_eq!(
                 outcome
                     .report
@@ -1203,6 +1313,66 @@ mod tests {
             } else {
                 assert_eq!(driver.commands, 1);
                 assert_eq!(outcome.report.stages.len(), 3);
+            }
+        }
+    }
+
+    #[test]
+    fn refuted_baseline_without_admissible_edits_is_unsat_with_conflicting_obligations() {
+        use crate::acceptance::ObligationStatus;
+        for writable in [vec![], vec!["f".to_owned()]] {
+            let mut f = Fixture::new(true);
+            let mut config = config(&mut f);
+            config.writable = writable.clone();
+            let mut driver = Simulated {
+                mode: "refute",
+                policy: f.policy,
+                commands: 0,
+            };
+            let outcome = run_with(&mut f.graph, &f.audit, f.goal, &config, &mut driver).unwrap();
+            let report = &outcome.report;
+            assert_eq!(driver.commands, 1);
+            let acceptance = report.acceptance.as_ref().unwrap();
+            assert_eq!(acceptance.obligations[0].status, ObligationStatus::Refuted);
+            assert_eq!(acceptance.obligations[0].refuting_evidence.len(), 1);
+            if writable.is_empty() {
+                // The sealed policy admits exactly one candidate (the baseline)
+                // and deterministic evidence contradicts a binding obligation.
+                assert_eq!(report.state, MissionState::Unsat);
+                assert_eq!(report.stages.len(), 1, "reviewers cannot override D-");
+                let conflict = report
+                    .failures
+                    .iter()
+                    .find_map(|r| match f.graph.get(*r).unwrap() {
+                        Object::Fail(fail) if fail.code == FailCode::ConflictingObligations => {
+                            Some(fail)
+                        }
+                        _ => None,
+                    })
+                    .expect("conflicting obligations failure");
+                assert_eq!(conflict.class, FailClass::Goal);
+                let diagnostic = f.graph.cas().get(conflict.diagnostic).unwrap();
+                let text = String::from_utf8(diagnostic).unwrap();
+                assert!(
+                    text.contains(
+                        &acceptance.obligations[0].refuting_evidence[0]
+                            .cid
+                            .to_string()
+                    )
+                );
+                assert!(
+                    report
+                        .evidence
+                        .contains(&acceptance.obligations[0].refuting_evidence[0])
+                );
+                let stored: serde_json::Value =
+                    serde_json::from_slice(&f.audit.get(outcome.private_record).unwrap()).unwrap();
+                assert_eq!(stored["state"], "UNSAT");
+            } else {
+                // Another candidate could exist: a failed candidate is PARTIAL.
+                assert_eq!(report.state, MissionState::Partial);
+                assert_eq!(report.stages.len(), 3);
+                assert!(report.failures.is_empty());
             }
         }
     }

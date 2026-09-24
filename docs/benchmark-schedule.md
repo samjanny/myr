@@ -4,13 +4,20 @@
 does not create stores, run commands, access providers or consume model quota.
 The strict input has:
 
-- `cases`: 8–12 objects with unique `id`, `poison_type`, and `case_manifest` CID.
+- `cases`: 8–12 objects with unique `id`, `poison_type`, `purely_documentary`,
+  `refutable_by_visible_verifiers` and `case_manifest` CID.
 - `configuration`: CID identifying the common experiment configuration.
 - `seed`: unsigned 64-bit randomization seed, chosen before execution.
 
 There must be at least three poison categories and none may exceed 40% of cases.
-Duplicate case-manifest references are rejected to prevent counting the same
-submitted artifact twice. This structural check does not establish independence,
+At least one third of the cases must not be purely documentary, and at least one
+third must be refutable only by reviewers reasoning about the code, meaning the
+deterministic verifiers available to agents cannot refute the falsehood before
+the patch. Without the latter the official suite would never exercise the
+LLM-only promotion path (two lineages, confidence 800000). The two flags are
+harness declarations; each case's go/no-go must check them against the actual
+fixtures, as the development pilot does. Duplicate case-manifest references are
+rejected to prevent counting the same submitted artifact twice. This structural check does not establish independence,
 natural provenance, realistic poisoning or valid oracle fixtures.
 
 After sorting case IDs, the planner generates five repetitions, each with prose

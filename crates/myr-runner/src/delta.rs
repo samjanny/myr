@@ -59,6 +59,13 @@ pub fn reconstruct_live(
     reconstruct(graph.cas(), &baseline, scope, &deltas, writable, protected)
 }
 
+/// Exact-component prefix match used for write capabilities and protections:
+/// `src` covers `src` and `src/lib.rs`, never `srclib.rs`.
+pub fn path_within(prefix: &str, path: &str) -> bool {
+    let prefix = prefix.trim_end_matches('/');
+    path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
 /// Reconstruct from one sealed baseline. The caller must establish that DELTAs
 /// and their assumptions are live in the graph before invoking this function.
 pub fn reconstruct(
@@ -78,10 +85,7 @@ pub fn reconstruct(
         if &delta.scope != scope || !seen.insert(&delta.path) {
             return Err(invalid("DELTA scope mismatch or competing edits to one path").into());
         }
-        let matches = |prefix: &String| {
-            let prefix = prefix.trim_end_matches('/');
-            delta.path == prefix || delta.path.starts_with(&format!("{prefix}/"))
-        };
+        let matches = |prefix: &String| path_within(prefix, &delta.path);
         if protected.iter().any(matches) || !writable.iter().any(matches) {
             return Err(invalid("DELTA path is outside write capabilities or protected").into());
         }

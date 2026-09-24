@@ -1,6 +1,6 @@
 # Myr
 
-[![CI](https://github.com/samjanny/myr-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/samjanny/myr-lang/actions/workflows/ci.yml)
+[![CI](https://github.com/samjanny/myr/actions/workflows/ci.yml/badge.svg)](https://github.com/samjanny/myr/actions/workflows/ci.yml)
 
 Myr is a Rust runtime for typed, content-addressed communication between AI
 agents. It separates claims from verified facts, records explicit assumptions,
@@ -36,7 +36,8 @@ remaining live checks are documented in [transports](docs/transports.md).
 - Immutable filesystem storage and a SQLite dependency/evidence graph.
 - Claims, attestations, runtime evidence, promoted facts and invalidation.
 - YAML mission validation with auditable `INVALID_GOAL` reports, a sealed Goal IR
-  and protected paths.
+  and protected paths; evidence-backed `UNSAT` when deterministic evidence refutes
+  the only admissible candidate.
 - A planner/worker/two-reviewer pipeline with shared call, token and time budgets.
 - Candidate reconstruction from full replacements or exact unified diffs.
 - Explicit Docker Linux verifier execution and scalar empirical measurements.
@@ -88,7 +89,7 @@ Other commands:
 | `seal`, `inspect-goal` | Compile/revalidate Goal IR against stored references |
 | `show`, `invalidate` | Inspect objects or invalidate an assumption |
 | `export-candidate` | Recover a live candidate into a new directory |
-| `pilot` | Run the local development fixture with simulated agents |
+| `pilot` | Run the two local development fixtures with simulated agents |
 | `plan-benchmark` | Generate a reproducible randomized job plan |
 | `collect-benchmark` | Join receipts and report missing/invalid pairs |
 | `analyze-benchmark` | Analyze complete paired measurements |

@@ -26,8 +26,9 @@ CAS artifacts through the candidate manifest.
 For valid input, `--prepare-only` writes `prepared.json`, a graph and shared CAS. It does not check
 provider authentication, launch Docker, or prove configured tools exist. Execution
 adds private audit records and `result.json`. Completed/conditionally completed
-missions return exit code zero; PARTIAL and INVALID_GOAL return a nonzero exit code after printing
-and saving the result. Configuration or storage failures also return nonzero.
+missions return exit code zero; PARTIAL, UNSAT and INVALID_GOAL return a nonzero exit code after printing
+and saving the result. UNSAT is recorded only with a deterministic refutation of
+the sole admissible candidate; see [the sealed pipeline](sealed-pipeline.md). Configuration or storage failures also return nonzero.
 
 An invalid mission YAML produces `INVALID_GOAL` with phase `admission`, including
 when `--prepare-only` is set. The result stores the exact submitted bytes, a
@@ -101,9 +102,9 @@ includes the mission/policy input, baseline files, diagnostic and any objects
 created by the planner. Empty evidence means no evidence was produced, not that
 the requested obligations were verified. Post-seal reports expose the same four
 result fields; these are historical results, not a fresh liveness assessment.
-Input-admission INVALID_GOAL reporting is implemented. Evidence-backed UNSAT,
-live empirical/provider/sandbox acceptance, crash recovery and benchmark
-deliverables remain open.
+Input-admission INVALID_GOAL reporting and evidence-backed UNSAT for the sole
+admissible candidate are implemented. Live empirical/provider/sandbox acceptance,
+crash recovery and benchmark deliverables remain open.
 
 ## Exporting a candidate
 

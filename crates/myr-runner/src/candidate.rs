@@ -30,6 +30,23 @@ pub struct Manifest {
     pub files: BTreeMap<String, ObjectRef>,
 }
 
+impl Manifest {
+    /// Baseline paths a worker could have changed under this manifest's write
+    /// prefixes and the sealed protections. DELTAs can only modify existing
+    /// paths, so an empty result means the baseline was the only admissible
+    /// candidate under the sealed policy.
+    pub fn editable_paths(&self, protected: &[String]) -> Vec<String> {
+        self.files
+            .keys()
+            .filter(|path| {
+                self.writable.iter().any(|w| delta::path_within(w, path))
+                    && !protected.iter().any(|p| delta::path_within(p, path))
+            })
+            .cloned()
+            .collect()
+    }
+}
+
 /// Runtime-created input record and the files whose bytes it identifies.
 /// This records preparation, not execution or a sandbox attestation.
 pub struct RecordedCandidate {

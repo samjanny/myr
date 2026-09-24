@@ -13,6 +13,16 @@ Conflicts are reported without overriding the promotion policy: deterministic
 support can still establish a FACT in the presence of LLM disagreement according
 to Appendix B. Failed or missing obligations do not establish UNSAT.
 
+An obligation without an active FACT is `refuted` when live deterministic
+EVIDENCE contradicts it in its exact scope: a `CONTRADICTS` verdict on the sealed
+CLAIM or a `SUPPORTS` verdict on the same ATOM with opposite polarity (Appendix
+B.1). The refuting evidence references and their dependency closure are reported.
+LLM evidence never refutes; it can only block LLM-only promotion. In a candidate
+audit only refuting evidence bound to that candidate is retained, so contrary
+evidence recorded for another candidate leaves this one merely unproven.
+`refuted_by_deterministic_evidence` reports a refutation of one candidate; the
+pipeline decides whether it also proves the obligations incompatible.
+
 `all_binding_proven` is a necessary acceptance gate, not a terminal mission state.
 The caller must additionally establish that evidence concerns the final candidate,
 finish required pipeline stages, collect assumptions and outputs from those stages,

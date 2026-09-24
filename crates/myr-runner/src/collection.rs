@@ -201,6 +201,8 @@ mod tests {
                 .map(|i| schedule::Case {
                     id: format!("case-{i}"),
                     poison_type: format!("type-{}", i % 3),
+                    purely_documentary: i % 3 != 0,
+                    refutable_by_visible_verifiers: i % 3 != 0,
                     case_manifest: Cid([i; 32]),
                 })
                 .collect(),

@@ -15,15 +15,48 @@ Updated: 2026-09-24. Goal remains active and incomplete.
   the fixture pilot, sealed goal/task execution components, budgets and accounting; CLI implements `run`, `pilot`, `show`, `invalidate`, `seal`, `inspect-goal`, `check-mission`, and `snapshot`.
 - The published baseline passed **140 Windows tests**. These include context/schema
   accounting, journaled dispatch, task execution, and sealed role/model/billing enforcement.
-- The full offline suite now passes **144 Windows tests**, including interrupted
-  task-output retention and invalid mission admission. Formatting and all-target
-  Clippy also pass.
+- The full offline suite now passes **153 Windows tests**, including interrupted
+  task-output retention, invalid mission admission, evidence-backed UNSAT and the
+  reasoning-only pilot fixture. Formatting and all-target Clippy also pass.
+- Verification pass (2026-09-24, later session): three defects fixed with
+  regression tests. (1) Pending assumptions sealed in the Goal IR were never
+  materialized by `myr run`, so COMPLETE_WITH_ASSUMPTIONS was unreachable in a
+  real mission; the worker TASK now depends on every sealed pending assumption.
+  (2) The planner schema enumerated every catalog artifact CID, exceeding the
+  Claude Code command-line schema limit for repositories with more than a few
+  dozen files; sets above 16 members now use the CID pattern, with a test on a
+  2000-file catalog. (3) The worker TASK had no registry inputs, so `emit_claim`
+  could only reference predicates reachable through obligations; the sealed
+  registry is now in its inputs.
+- Evidence-backed UNSAT is implemented for the mechanically provable case: when
+  the sealed policy leaves no baseline path writable outside protected prefixes,
+  the baseline is the only admissible candidate, and bound deterministic evidence
+  contradicting a binding obligation yields state UNSAT with a
+  `CONFLICTING_OBLIGATIONS` FAIL whose diagnostic is a `myr-unsat-proof-v0`
+  artifact. Reviewers are not dispatched after such a proof. The acceptance audit
+  reports `refuted` obligations with candidate-bound refuting evidence. A refuted
+  candidate that could have been different remains PARTIAL. Tests cover both
+  branches, cross-candidate refutation and the private report.
+- Benchmark cases now declare `purely_documentary` and
+  `refutable_by_visible_verifiers`; `plan-benchmark` rejects suites with fewer
+  than one third non-documentary or one third reasoning-only cases. These are
+  declarations to be checked per case at go/no-go, not corpus admission.
+- Second development pilot fixture `padded-id` (misleading test name): the
+  visible test suite compiles and passes on the worker view, source view,
+  reference and contaminated candidates, so only reviewer reasoning can refute
+  the falsehood; the hidden oracle distinguishes the candidates on `" 42 "`.
+  The pilot report records per-case declarations and
+  `llm_only_promotion_exercised`: the true source claim is promoted at 800000
+  through two fixture lineages and the false one is blocked by LLM contradiction
+  alone. Reviewers remain scripted; this is plumbing evidence only.
+- Public repository renamed from `samjanny/myr-lang` to `samjanny/myr`; GitHub
+  redirects the old name and the local remote/badges were updated.
 - Input admission now records INVALID_GOAL for malformed mission YAML and input
   contract violations, with exact original bytes, runtime FAIL, dependency closure,
   zero model usage and a private immutable report. CLI tests cover invalid UTF-8,
   schema/path/command errors, the mission size bound, prepare-only, no overwrite,
   unreadable-input separation and no configuration/repository access. Library tests
-  reject attempts to label valid or ambiguous prose invalid. UNSAT remains open.
+  reject attempts to label valid or ambiguous prose invalid.
 - Coverage includes CLI measurement configuration, schedule/collection and
   CAS context provenance. Procedure setup, pre-store
   validation and goal compilation now reject malformed or unsealed measurement
@@ -164,7 +197,7 @@ Updated: 2026-09-24. Goal remains active and incomplete.
   `.myr/pilot-v0/report.json` plus separate stores/artifacts. Both view and oracle
   fixture gates passed. The fixture report explicitly marks simulated agents and
   development-only data. No active build/test process remains.
-- Public repository: `samjanny/myr-lang`. The publication includes English source,
+- Public repository: `samjanny/myr`. The publication includes English source,
   specification, documentation, fixtures and GitHub Actions CI. The original
   Italian specification remains local and ignored, along with build outputs,
   run stores, private audits and local runtime configuration.
@@ -183,14 +216,14 @@ Updated: 2026-09-24. Goal remains active and incomplete.
 | D2/D3 invalid output boundary, JSON/tools to CBOR | Role schemas, typed parsing, reference checks, capabilities, quarantine, repair limit, and runtime identities implemented and tested; provider schema compatibility pending |
 | D4/D5 CIDs, opaque artifacts, canonicalization | Implemented with golden vectors and opaque-byte tests |
 | D6 closed core and explicit mission predicates | Closed core and argument typing implemented; goal compiler validates registry membership, names, classes, and live references; planner/mission integration pending |
-| D9 assumptions and invalidation | Append-only invalidation objects, transitive stale propagation, historical reads tested; task-bound lazy materialization tested, including atomic insertion and refusal to revive invalidated assumptions |
+| D9 assumptions and invalidation | Append-only invalidation objects, transitive stale propagation, historical reads tested; task-bound lazy materialization tested, including atomic insertion and refusal to revive invalidated assumptions; `myr run` materializes every sealed pending assumption on the worker TASK |
 | D10 seeded falsehood benchmark | Not implemented; no official case-quality or outcome claims |
 | `mw0.cddl`, normative appendices, FAIL registry | Draft schema, extracted appendices, closed code registry exist; independent CDDL conformance check and normative freeze pending |
 | `lineage-v0` | Pairwise producer AND family independence tested, unknown fields excluded; per-role provider/model/billing configuration sealed and enforced; official benchmark model freeze pending |
 | `promotion-policy-v0` | Pure policy and persistent lifecycle tests pass; runtime command/reviewer provenance and candidate acceptance checks implemented; live sandbox/provider conformance and complete orchestration pending |
 | CAS put/get/exists, verified reads | Implemented and tested; bounded repository snapshot reader and new-store CLI import preserve opaque bytes and retain read policy; no source-view blobs loaded |
 | Graph supports/contradicts/attests/depends_on/assumes/conflicts | Implemented; production trust boundary remains in adapter/runner |
-| Fixture pilot before LLM adapter | Implemented and tested: twin-view byte-range/hash checks, shared-CAS isolation, simulated source/worker/two reviewers, graph outputs, reference/contaminated oracle fixtures; development-only |
+| Fixture pilot before LLM adapter | Implemented and tested with two development cases: a documentary false comment and a misleading test refutable only by reasoning; twin-view byte-range/hash checks, shared-CAS isolation, simulated source/worker/two reviewers, graph outputs, reference/contaminated oracle fixtures, visible-verifier and LLM-only promotion gates; development-only |
 | Two providers, identical assertion, identical CLAIM CID | Adapter test confirms same CLAIM and different ATTEST for two configured identities; live-provider acceptance still required |
 | Three-level adapter validation and max two repairs | Implemented; schema/semantic failures allow two repairs, third emits runtime FAIL, policy violation fails immediately |
 | Codex and Claude Code subscription backends | Implemented with auth checks and isolated bounded subprocesses; Claude Max finish smoke passed; Codex live and sandbox conformance pending |
@@ -200,11 +233,11 @@ Updated: 2026-09-24. Goal remains active and incomplete.
 | Baseline + DELTA reconstruction, deterministic sandbox | Exact reconstruction, candidate provenance, Docker execution and runtime command/measurement EVIDENCE implemented; live confinement and native backends pending |
 | Both DELTA codecs | Runner applies full replacement and exact single-file unified diff; opaque bytes and newline behavior tested. Adapter exposes both codecs with task-local patch/result references; live mission integration pending |
 | Fixed planner/worker/two-reviewer pipeline | Prepared-catalog planner/worker/command/two-reviewer coordination, setup and CLI implemented with one budget and journal; injected tests pass; live acceptance pending |
-| Five terminal states with truthful evidence | Post-seal COMPLETE/COMPLETE_WITH_ASSUMPTIONS/PARTIAL uses candidate-bound facts and completed stages; input-admission INVALID_GOAL retains original bytes and validation provenance; evidence-backed UNSAT remains pending |
+| Five terminal states with truthful evidence | Post-seal COMPLETE/COMPLETE_WITH_ASSUMPTIONS/PARTIAL uses candidate-bound facts and completed stages; input-admission INVALID_GOAL retains original bytes and validation provenance; UNSAT is recorded only with a deterministic refutation of the sole admissible candidate and a CONFLICTING_OBLIGATIONS proof artifact; live acceptance pending |
 | `myr run`, `show`, `invalidate` | Commands implemented; run preparation and offline failure path have binary tests; successful live mission acceptance remains pending |
 | Comparable prose baseline | Not implemented |
 | `token-accounting-v0`, cl100k_base, frozen renderer | Compact renderer, pinned cl100k_base tokenizer, per-segment/per-call ledger, CAS byte separation and implementation fingerprints implemented; exact context assembly and private audit retention tested; exact shared/protocol schema partition tested; budgeted transport dispatch tested with injected transport; concrete baseline schema, full role integration, differential tokenizer validation and manifest freeze pending |
-| 8–12 valid primary cases, category/proportion rules | Corpus and provenance/credibility pilot missing; do not pad with artificial official cases |
+| 8–12 valid primary cases, category/proportion rules | Category, non-documentary and reasoning-only proportion rules enforced by the schedule planner; corpus and provenance/credibility pilot missing; do not pad with artificial official cases. The owner requires the first official case to be refutable only by reasoning |
 | source_view/worker_view, view_diff, no side channels | Development harness verifies hashes/declared edits, rejects path collisions, and excludes source bytes/hashes from shared CAS/task context; official corpus checks pending |
 | Oracle PASS/HARMFUL fixtures, INVALID handling | Development oracle plus compiled behavior tests implemented; arbitrary candidate returns INVALID; official oracles still required |
 | Preregistered manifest, randomized paired repetitions | Reproducible paired schedule and verification implemented; official admission/freeze, provider seed support and execution pending |
@@ -216,8 +249,9 @@ Updated: 2026-09-24. Goal remains active and incomplete.
 1. Complete live provider/schema and sandbox-conformance acceptance. Claude Code
    has passed only a minimal finish smoke. Preserve explicit billing choice; do
    not inspect credentials or treat fixture/mock success as live evidence.
-2. Complete evidence-backed UNSAT handling, interruption recovery and candidate
-   lifecycle behavior; preserve the separation between invalid user inputs,
+2. Complete interruption recovery and candidate lifecycle behavior (evidence
+   recorded for one candidate blocks graph-level promotion for later candidates
+   in the same scope); preserve the separation between invalid user inputs,
    invalid planner outputs and infrastructure failures.
 3. Complete accounting, matched baseline, corpus checks, missing-data statistics, freezing,
    official runs, and report. Keep development evidence separate from official data.

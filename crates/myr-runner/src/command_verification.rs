@@ -654,6 +654,17 @@ pub(crate) mod tests {
             assert!(f.graph.cas().get(run.private_audit).is_err());
             let audit = assess_candidate(&f.graph, &f.audit, candidate.reference()).unwrap();
             assert_eq!(audit.all_binding_proven(), (code == 0) == polarity);
+            if (code == 0) != polarity {
+                assert_eq!(audit.obligations[0].status, ObligationStatus::Refuted);
+                assert_eq!(
+                    audit.obligations[0].refuting_evidence,
+                    vec![verification.evidence]
+                );
+                assert!(audit.evidence.contains(&verification.evidence));
+                assert!(audit.refuted_by_deterministic_evidence());
+            } else {
+                assert!(audit.obligations[0].refuting_evidence.is_empty());
+            }
             let Object::Evidence(evidence) = f.graph.get(verification.evidence).unwrap() else {
                 unreachable!()
             };
@@ -732,6 +743,20 @@ pub(crate) mod tests {
                 .unwrap()
                 .all_binding_proven()
         );
+        // Contrary evidence recorded for one candidate refutes that candidate
+        // only; a different candidate in the same scope is merely unproven.
+        let refuting_execution = f.execution(original.reference(), 7);
+        record(&mut f.graph, &f.audit, f.atom, refuting_execution).unwrap();
+        let audit = assess_candidate(&f.graph, &f.audit, original.reference()).unwrap();
+        assert_eq!(audit.obligations[0].status, ObligationStatus::Refuted);
+        let third =
+            candidate::prepare_recorded(&mut f.graph, f.goal, &[], &["f".into(), "g".into()])
+                .unwrap();
+        assert_ne!(third.reference(), original.reference());
+        let audit = assess_candidate(&f.graph, &f.audit, third.reference()).unwrap();
+        assert_eq!(audit.obligations[0].status, ObligationStatus::MissingFact);
+        assert!(audit.obligations[0].refuting_evidence.is_empty());
+        assert!(!audit.refuted_by_deterministic_evidence());
     }
 
     #[test]
