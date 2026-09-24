@@ -34,7 +34,16 @@ artifact creation followed by a reference receipt and finish, three malformed
 responses triggering repair exhaustion, and a task call limit that stops requests
 while the mission budget still has capacity. No live model calls were made.
 
-Fixed planner/worker/two-reviewer orchestration,
-durable recovery, complete CAS read telemetry, provenance audit of context classes,
-sandbox execution, and final mission-state computation remain pending. The caller
-currently supplies trusted SessionConfig and the shared baseline schema.
+When a loop error escapes after successful emissions, `Error::Interrupted`
+retains the task reference, committed output references and original error.
+The pipeline includes those outputs and their dependencies in its PARTIAL report,
+including its immutable private copy. It neither replays provider requests nor
+applies an output whose dispatch checkpoint failed. Errors before any successful
+emission keep their original variant. Checkpoint-collision tests cover a worker
+artifact and candidate-bound reviewer evidence.
+
+The fixed planner/worker/two-reviewer pipeline, CAS read/context accounting and
+candidate-bound final acceptance are implemented; see `sealed-pipeline.md`.
+Durable recovery after process termination and live provider/sandbox acceptance
+remain pending. In-memory error retention does not cover a crash during an
+adapter transaction or replace an atomic persistent task-output journal.

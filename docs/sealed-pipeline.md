@@ -46,8 +46,10 @@ recovery are not implemented.
 If a task loop returns an infrastructure error while the stores remain usable,
 the report retains an unfinished stage and a runtime FAIL linked to the issued
 TASK (when still live). Historical task dependencies remain in report provenance,
-including dependencies of an inactive task. This preserves issued-task context;
-it does not reconstruct unreturned intermediate outputs from an interrupted loop.
+including dependencies of an inactive task. A task interruption error also carries
+successful emissions from earlier loop iterations; those outputs enter the stage,
+result contents and private report without replaying provider requests. Recovery
+after process termination or an interrupted adapter transaction remains open.
 
 Tests drive the real task loop, adapter, graph, candidate reconstruction, command
 recording and acceptance with synthetic provider/executor responses. They cover

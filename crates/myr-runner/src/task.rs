@@ -41,6 +41,24 @@ pub enum Error {
     Adapter(#[from] myr_adapter::Error),
     #[error("task dispatch: {0}")]
     Dispatch(#[from] crate::dispatch::Error),
+    #[error("task interrupted after committing outputs: {source}")]
+    Interrupted {
+        task: ObjectRef,
+        objects: Vec<ObjectRef>,
+        #[source]
+        source: Box<Error>,
+    },
+}
+
+impl Error {
+    /// Already committed outputs, never a successful task result or a replay
+    /// instruction. A different task must not inherit these references.
+    pub fn committed_objects(&self, task_ref: ObjectRef) -> &[ObjectRef] {
+        match self {
+            Self::Interrupted { task, objects, .. } if *task == task_ref => objects,
+            _ => &[],
+        }
+    }
 }
 
 pub fn run(
@@ -54,7 +72,7 @@ pub fn run(
 fn failure(
     graph: &mut Graph,
     task: ObjectRef,
-    objects: Vec<ObjectRef>,
+    objects: &[ObjectRef],
     code: FailCode,
 ) -> Result<TaskResult, Error> {
     let diagnostic = graph
@@ -77,7 +95,7 @@ fn failure(
         .map_err(crate::Error::from)?;
     Ok(TaskResult {
         finished: false,
-        objects,
+        objects: objects.to_vec(),
         failure: Some(fail),
     })
 }
@@ -161,113 +179,127 @@ pub(crate) fn run_with(
     )];
     let mut objects = Vec::new();
     let mut cas_segments = Vec::new();
-    loop {
-        if !graph.live(task_ref).map_err(crate::Error::from)? {
-            return failure(graph, task_ref, objects, FailCode::InvalidatedReference);
-        }
-        let segments: Vec<_> = history
-            .iter()
-            .map(|(kind, text)| Segment { kind: *kind, text })
-            .collect();
-        let context = PreparedContext::new(&execution.system, &segments)?
-            .with_cas_prompt_segments(&cas_segments)?;
-        let mut call = Call {
-            agent: &agent,
-            provider: &execution.provider,
-            context: &context,
-            schema: &schema,
-            shared_schema: &execution.shared_schema,
-            max_native_output_tokens: execution.max_native_output_tokens,
-            max_reference_output_tokens: execution.max_reference_output_tokens,
-            timeout: Duration::from_millis(task.time_budget_ms),
-        };
-        let input = dispatcher.preview_tokens(&call)?;
-        let permit = match budget.reserve(input, execution.max_reference_output_tokens) {
-            Ok(p) => p,
-            Err(code) => return failure(graph, task_ref, objects, code),
-        };
-        call.timeout = permit.timeout();
-        call.max_reference_output_tokens = permit.output_reference_allowance();
-        let completion = match dispatcher.complete_with(call, &mut send) {
-            Ok(c) => c,
-            Err(crate::dispatch::Error::Budget(code)) => {
-                let _ = budget.settle(permit, None);
-                return failure(graph, task_ref, objects, code);
+    let result = (|| {
+        loop {
+            if !graph.live(task_ref).map_err(crate::Error::from)? {
+                return failure(graph, task_ref, &objects, FailCode::InvalidatedReference);
             }
-            Err(crate::dispatch::Error::Transport(_)) => {
-                let _ = budget.settle(permit, None);
-                return failure(graph, task_ref, objects, FailCode::ProviderUnavailable);
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let raw = std::str::from_utf8(&completion.raw_output).ok();
-        if let Err(code) = budget.settle(permit, raw.map(|s| tokenizer.count(s))) {
-            return failure(graph, task_ref, objects, code);
-        }
-        if !graph.live(task_ref).map_err(crate::Error::from)? {
-            return failure(graph, task_ref, objects, FailCode::InvalidatedReference);
-        }
-        let response = serde_json::from_slice::<Response>(&completion.raw_output).ok();
-        let outcome = session.handle(graph, &completion.raw_output)?;
-        match outcome {
-            Outcome::Applied {
-                fetched_raw_bytes,
-                objects: emitted,
-                result,
-                done,
-            } => {
-                if let Some(bytes) = fetched_raw_bytes {
-                    dispatcher.record_cas_read(bytes)?;
+            let segments: Vec<_> = history
+                .iter()
+                .map(|(kind, text)| Segment { kind: *kind, text })
+                .collect();
+            let context = PreparedContext::new(&execution.system, &segments)?
+                .with_cas_prompt_segments(&cas_segments)?;
+            let mut call = Call {
+                agent: &agent,
+                provider: &execution.provider,
+                context: &context,
+                schema: &schema,
+                shared_schema: &execution.shared_schema,
+                max_native_output_tokens: execution.max_native_output_tokens,
+                max_reference_output_tokens: execution.max_reference_output_tokens,
+                timeout: Duration::from_millis(task.time_budget_ms),
+            };
+            let input = dispatcher.preview_tokens(&call)?;
+            let permit = match budget.reserve(input, execution.max_reference_output_tokens) {
+                Ok(p) => p,
+                Err(code) => return failure(graph, task_ref, &objects, code),
+            };
+            call.timeout = permit.timeout();
+            call.max_reference_output_tokens = permit.output_reference_allowance();
+            let completion = match dispatcher.complete_with(call, &mut send) {
+                Ok(c) => c,
+                Err(crate::dispatch::Error::Budget(code)) => {
+                    let _ = budget.settle(permit, None);
+                    return failure(graph, task_ref, &objects, code);
                 }
-                let receipt = serde_json::json!({"objects":emitted,"result":result});
-                objects.extend(emitted);
-                if done {
+                Err(crate::dispatch::Error::Transport(_)) => {
+                    let _ = budget.settle(permit, None);
+                    return failure(graph, task_ref, &objects, FailCode::ProviderUnavailable);
+                }
+                Err(e) => return Err(e.into()),
+            };
+            let raw = std::str::from_utf8(&completion.raw_output).ok();
+            if let Err(code) = budget.settle(permit, raw.map(|s| tokenizer.count(s))) {
+                return failure(graph, task_ref, &objects, code);
+            }
+            if !graph.live(task_ref).map_err(crate::Error::from)? {
+                return failure(graph, task_ref, &objects, FailCode::InvalidatedReference);
+            }
+            let response = serde_json::from_slice::<Response>(&completion.raw_output).ok();
+            let outcome = session.handle(graph, &completion.raw_output)?;
+            match outcome {
+                Outcome::Applied {
+                    fetched_raw_bytes,
+                    objects: emitted,
+                    result,
+                    done,
+                } => {
+                    // Retain committed outputs before any subsequent fallible audit.
+                    objects.extend(emitted.iter().copied());
+                    if let Some(bytes) = fetched_raw_bytes {
+                        dispatcher.record_cas_read(bytes)?;
+                    }
+                    let receipt = serde_json::json!({"objects":emitted,"result":result});
+                    if done {
+                        return Ok(TaskResult {
+                            finished: true,
+                            objects: objects.clone(),
+                            failure: None,
+                        });
+                    }
+                    let kind = match response.map(|r| r.action) {
+                        Some(Action::Fetch { reference }) if reference == task.instruction => {
+                            SegmentKind::Goal
+                        }
+                        Some(Action::Fetch { reference })
+                            if baseline.values().any(|r| *r == reference) =>
+                        {
+                            SegmentKind::DirectRepo
+                        }
+                        Some(Action::Fetch { reference }) if reference.kind == Kind::Artifact => {
+                            SegmentKind::CasReferenced
+                        }
+                        Some(Action::Fetch { .. }) => SegmentKind::MwRender,
+                        _ => SegmentKind::LocalTool,
+                    };
+                    history.push((SegmentKind::LocalTool, raw.unwrap_or_default().into()));
+                    if fetched_raw_bytes.is_some() {
+                        cas_segments.push(history.len());
+                    }
+                    history.push((
+                        kind,
+                        serde_json::to_string(&receipt).map_err(crate::Error::from)?,
+                    ));
+                }
+                Outcome::Repair { attempt, message } => {
+                    history.push((SegmentKind::LocalTool, raw.unwrap_or_default().into()));
+                    history.push((
+                        SegmentKind::ValidationFeedback,
+                        serde_json::json!({"repair_attempt":attempt,"message":message}).to_string(),
+                    ));
+                }
+                Outcome::Failed { failure } => {
                     return Ok(TaskResult {
-                        finished: true,
-                        objects,
-                        failure: None,
+                        finished: false,
+                        objects: objects.clone(),
+                        failure: Some(failure),
                     });
                 }
-                let kind = match response.map(|r| r.action) {
-                    Some(Action::Fetch { reference }) if reference == task.instruction => {
-                        SegmentKind::Goal
-                    }
-                    Some(Action::Fetch { reference })
-                        if baseline.values().any(|r| *r == reference) =>
-                    {
-                        SegmentKind::DirectRepo
-                    }
-                    Some(Action::Fetch { reference }) if reference.kind == Kind::Artifact => {
-                        SegmentKind::CasReferenced
-                    }
-                    Some(Action::Fetch { .. }) => SegmentKind::MwRender,
-                    _ => SegmentKind::LocalTool,
-                };
-                history.push((SegmentKind::LocalTool, raw.unwrap_or_default().into()));
-                if fetched_raw_bytes.is_some() {
-                    cas_segments.push(history.len());
-                }
-                history.push((
-                    kind,
-                    serde_json::to_string(&receipt).map_err(crate::Error::from)?,
-                ));
-            }
-            Outcome::Repair { attempt, message } => {
-                history.push((SegmentKind::LocalTool, raw.unwrap_or_default().into()));
-                history.push((
-                    SegmentKind::ValidationFeedback,
-                    serde_json::json!({"repair_attempt":attempt,"message":message}).to_string(),
-                ));
-            }
-            Outcome::Failed { failure } => {
-                return Ok(TaskResult {
-                    finished: false,
-                    objects,
-                    failure: Some(failure),
-                });
             }
         }
-    }
+    })();
+    result.map_err(|source| {
+        if objects.is_empty() {
+            source
+        } else {
+            Error::Interrupted {
+                task: task_ref,
+                objects,
+                source: Box::new(source),
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -660,6 +692,40 @@ mod tests {
         .unwrap();
         assert!(!result.finished);
         assert_eq!(dispatcher.accounting().totals().cas_raw_bytes, 0);
+    }
+
+    #[test]
+    fn audit_failure_retains_committed_outputs_without_replaying_the_provider() {
+        let (_dir, mut graph, mut dispatcher, execution) = fixture(5);
+        let task_ref = execution.session.task;
+        // First completion commits an artifact; second completion cannot finish
+        // its audit checkpoint and must never reach the adapter.
+        std::fs::write(
+            dispatcher
+                .journal_directory()
+                .join("00000000000000000003.json"),
+            b"occupied",
+        )
+        .unwrap();
+        let mut calls = 0;
+        let error = run_with(&mut graph, &mut dispatcher, execution, |_, _| {
+            calls += 1;
+            reply(if calls == 1 {
+                r#"{"action":{"tool":"put_artifact","arguments":{"content_base64":"eA=="}}}"#
+            } else {
+                r#"{"action":{"tool":"put_artifact","arguments":{"content_base64":"eQ=="}}}"#
+            })
+        })
+        .unwrap_err();
+        assert_eq!(calls, 2);
+        let outputs = error.committed_objects(task_ref);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(graph.cas().get(outputs[0]).unwrap(), b"x");
+        assert!(graph.resolve(myr_wire::artifact_cid(b"y")).is_err());
+        assert!(error.committed_objects(outputs[0]).is_empty());
+        assert!(
+            matches!(error, Error::Interrupted { source, .. } if matches!(*source, Error::Dispatch(_)))
+        );
     }
 
     #[test]

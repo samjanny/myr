@@ -315,9 +315,9 @@ fn fail_stage(
     report: &mut Report,
     slot: RoleSlot,
     task: ObjectRef,
-    message: &str,
+    error: &task::Error,
 ) -> crate::Result<()> {
-    let diagnostic = graph.register_artifact(message.as_bytes())?;
+    let diagnostic = graph.register_artifact(error.to_string().as_bytes())?;
     let failure = graph.insert(
         Authority::Runtime,
         &Object::Fail(Fail {
@@ -333,7 +333,7 @@ fn fail_stage(
         task,
         result: task::TaskResult {
             finished: false,
-            objects: vec![],
+            objects: error.committed_objects(task).to_vec(),
             failure: Some(failure),
         },
     });
@@ -461,13 +461,7 @@ fn run_existing_with(
     let work = match result {
         Ok(result) => result,
         Err(error) => {
-            fail_stage(
-                graph,
-                &mut report,
-                RoleSlot::Worker,
-                worker,
-                &error.to_string(),
-            )?;
+            fail_stage(graph, &mut report, RoleSlot::Worker, worker, &error)?;
             return finish(graph, audit, dispatcher, report, deadline);
         }
     };
@@ -611,7 +605,7 @@ fn run_existing_with(
                 }
                 report.stages.push(Stage { slot, task, result });
             }
-            Err(error) => fail_stage(graph, &mut report, slot, task, &error.to_string())?,
+            Err(error) => fail_stage(graph, &mut report, slot, task, &error)?,
         }
     }
     if remaining().is_zero() {
@@ -750,12 +744,30 @@ mod tests {
                 .copied()
                 .filter(|r| r.kind == Kind::Claim)
                 .collect();
+            let interrupt = (self.mode == "interrupt_worker" && slot == RoleSlot::Worker)
+                || (self.mode == "interrupt_reviewer" && slot == RoleSlot::ReviewerA);
+            if interrupt {
+                let sequence = std::fs::read_dir(dispatcher.journal_directory())
+                    .unwrap()
+                    .count();
+                std::fs::write(
+                    dispatcher
+                        .journal_directory()
+                        .join(format!("{:020}.json", sequence + 3)),
+                    b"injected checkpoint collision",
+                )
+                .unwrap();
+            }
             let mut calls = 0;
             task::run_with(graph, dispatcher, execution, |_, _| {
                 let raw_output = if self.mode == "bad_worker" && slot == RoleSlot::Worker {
                     b"invalid response".to_vec()
                 } else {
-                    let action = if slot == RoleSlot::Worker
+                    let action = if interrupt && slot == RoleSlot::Worker && calls == 0 {
+                        Action::PutArtifact {
+                            content_base64: "eA==".into(),
+                        }
+                    } else if slot == RoleSlot::Worker
                         || self.mode == "empty_review"
                         || calls >= claims.len()
                     {
@@ -885,6 +897,49 @@ mod tests {
                     mode == "empirical_success"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn interrupted_tasks_preserve_committed_outputs_in_partial_private_reports() {
+        for (mode, slot, kind) in [
+            ("interrupt_worker", RoleSlot::Worker, Kind::Artifact),
+            ("interrupt_reviewer", RoleSlot::ReviewerA, Kind::Evidence),
+        ] {
+            let mut f = Fixture::new(true);
+            let config = config(&mut f);
+            let mut driver = Simulated {
+                mode,
+                policy: f.policy,
+                commands: 0,
+            };
+            let outcome = run_with(&mut f.graph, &f.audit, f.goal, &config, &mut driver).unwrap();
+            let report = &outcome.report;
+            assert_eq!(report.state, MissionState::Partial);
+            let stage = report
+                .stages
+                .iter()
+                .find(|stage| stage.slot == slot)
+                .unwrap();
+            assert!(!stage.result.finished);
+            assert!(stage.result.failure.is_some());
+            let output = *stage
+                .result
+                .objects
+                .iter()
+                .find(|r| r.kind == kind)
+                .unwrap();
+            assert!(report.provenance.contains(&output));
+            if kind == Kind::Artifact {
+                assert!(report.artifacts.contains(&output));
+                assert_eq!(f.graph.cas().get(output).unwrap(), b"x");
+                assert!(report.candidate.is_none());
+            } else {
+                assert!(report.evidence.contains(&output));
+            }
+            let stored: serde_json::Value =
+                serde_json::from_slice(&f.audit.get(outcome.private_record).unwrap()).unwrap();
+            assert_eq!(stored, serde_json::to_value(report).unwrap());
         }
     }
 

@@ -13,8 +13,10 @@ Updated: 2026-09-24. Goal remains active and incomplete.
 - All seven crates now exist. Core/wire/CAS/graph are implemented; adapter has
   the validated action boundary and four explicit provider transports; runner has
   the fixture pilot, sealed goal/task execution components, budgets and accounting; CLI implements `run`, `pilot`, `show`, `invalidate`, `seal`, `inspect-goal`, `check-mission`, and `snapshot`.
-- The full offline workspace suite passed **140 Windows tests**. These include context/schema
+- The published baseline passed **140 Windows tests**. These include context/schema
   accounting, journaled dispatch, task execution, and sealed role/model/billing enforcement.
+- The full offline suite now passes **142 Windows tests**, including interrupted
+  task-output retention. Formatting and all-target Clippy also pass.
 - Coverage includes CLI measurement configuration, schedule/collection and
   CAS context provenance. Procedure setup, pre-store
   validation and goal compilation now reject malformed or unsealed measurement
@@ -41,8 +43,10 @@ Updated: 2026-09-24. Goal remains active and incomplete.
 - Pipeline infrastructure failures now retain the issued worker/reviewer stage,
   a task-linked runtime FAIL when the task remains live, and historical task
   dependencies in result provenance. Injected worker/reviewer failures remain
-  PARTIAL. Recovery of intermediate outputs not returned by an interrupted task
-  loop remains open.
+  PARTIAL. Task errors now retain outputs committed by prior successful adapter
+  calls; worker artifacts and reviewer evidence enter the report and private
+  immutable record without provider replay. Checkpoint-collision regressions pass.
+  Process-crash recovery and interruption inside an adapter transaction remain open.
 - `core.artifact_equals` now requires two ARTIFACT references at graph insertion
   and goal validation, using one core argument validator. Tests reject CLAIM,
   GOAL and PREDICATE_DEF arguments in either position and verify transactional
@@ -142,7 +146,9 @@ Updated: 2026-09-24. Goal remains active and incomplete.
   injected-response tests; live acceptance remains incomplete.
 - `cargo clippy --workspace --all-targets --offline -- -D warnings`: passed.
 - `cargo fmt --all -- --check`: passed.
-- Checked on Windows with Rust/Cargo 1.95.0. No Linux or minimum-Rust-version run.
+- Locally checked on Windows with Rust/Cargo 1.95.0. Publication CI run
+  `36053217333` passed formatting/Clippy and tests on Linux stable, Windows stable
+  and Linux Rust 1.88.0 at commit `3b50484`.
 - One explicitly authorized Claude Code Max smoke call passed: structured `finish`,
   model `claude-haiku-4-5`, reported input/output tokens 2992/226. An earlier
   sandboxed attempt timed out with unknown usage. No live Codex/API calls,
