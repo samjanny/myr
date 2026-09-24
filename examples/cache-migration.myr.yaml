@@ -1,0 +1,8 @@
+goal: >
+  Replace the cache implementation while preserving existing behavior.
+verify:
+  - cargo test
+  - cargo clippy -- -D warnings
+protected:
+  - tests/
+  - myr.yaml

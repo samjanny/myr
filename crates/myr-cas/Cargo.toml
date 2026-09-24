@@ -1,0 +1,15 @@
+[package]
+name = "myr-cas"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+myr-core.workspace = true
+myr-wire.workspace = true
+thiserror.workspace = true
+hex.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

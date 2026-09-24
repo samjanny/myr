@@ -1,0 +1,19 @@
+[package]
+name = "myr-graph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+myr-core.workspace = true
+myr-wire.workspace = true
+myr-cas.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

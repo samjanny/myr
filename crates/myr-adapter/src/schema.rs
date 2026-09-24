@@ -1,0 +1,165 @@
+//! One response contract shared by every transport. Role-specific schemas do not
+//! expose tools for creating EVIDENCE, FACT, ATTEST, identities, or lineage.
+use crate::Role;
+use serde_json::{Value, json};
+
+pub struct SchemaPart {
+    pub protocol_only: bool,
+    pub text: String,
+}
+
+/// Partition the exact compact schema against the actual shared-tool baseline.
+/// Only byte-identical action declarations are exempt. A tool name alone never
+/// establishes that its arguments, reference kinds, or descriptions are shared.
+pub fn accounting_parts(
+    schema: &Value,
+    shared_schema: &Value,
+) -> Result<Vec<SchemaPart>, myr_core::ValidationError> {
+    let pointer = "/properties/action/anyOf";
+    let actions = schema
+        .pointer(pointer)
+        .and_then(Value::as_array)
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| myr_core::invalid("missing schema action alternatives"))?;
+    let shared = shared_schema
+        .pointer(pointer)
+        .and_then(Value::as_array)
+        .ok_or_else(|| myr_core::invalid("missing shared schema action alternatives"))?;
+    let declarations: Vec<String> = actions.iter().map(Value::to_string).collect();
+    let shared_declarations: std::collections::BTreeSet<String> =
+        shared.iter().map(Value::to_string).collect();
+    let joined = declarations.join(",");
+    let serialized = schema.to_string();
+    let offset = serialized
+        .find(&joined)
+        .ok_or_else(|| myr_core::invalid("schema serialization mismatch"))?;
+    let mut envelope = schema.clone();
+    let mut shared_envelope = shared_schema.clone();
+    *envelope.pointer_mut(pointer).expect("checked pointer") = json!([]);
+    *shared_envelope
+        .pointer_mut(pointer)
+        .expect("checked pointer") = json!([]);
+    let envelope_is_protocol = envelope != shared_envelope;
+    let mut parts = vec![SchemaPart {
+        protocol_only: envelope_is_protocol,
+        text: serialized[..offset].into(),
+    }];
+    for (index, declaration) in declarations.into_iter().enumerate() {
+        let protocol_only = !shared_declarations.contains(&declaration);
+        // Each array separator belongs to its following declaration.
+        parts.push(SchemaPart {
+            protocol_only,
+            text: if index == 0 {
+                declaration
+            } else {
+                format!(",{declaration}")
+            },
+        });
+    }
+    parts.push(SchemaPart {
+        protocol_only: envelope_is_protocol,
+        text: serialized[offset + joined.len()..].into(),
+    });
+    Ok(parts)
+}
+
+fn record(properties: Value) -> Value {
+    let required: Vec<_> = properties
+        .as_object()
+        .expect("schema properties")
+        .keys()
+        .cloned()
+        .collect();
+    json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
+}
+fn action(name: &str, properties: Value) -> Value {
+    record(json!({"tool":{"type":"string","enum":[name]},"arguments":record(properties)}))
+}
+fn reference(kind: Option<&str>) -> Value {
+    let kinds = kind.map(|s| json!([s])).unwrap_or_else(|| {
+        json!([
+            "ARTIFACT",
+            "TASK",
+            "CLAIM",
+            "EVIDENCE",
+            "FACT",
+            "ASSUMPTION",
+            "DELTA",
+            "FAIL",
+            "ATTEST",
+            "ATOM",
+            "PREDICATE_DEF",
+            "GOAL"
+        ])
+    });
+    record(
+        json!({"kind":{"type":"string","enum":kinds},"cid":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"}}),
+    )
+}
+fn list(items: Value) -> Value {
+    json!({"type":"array","items":items})
+}
+fn text() -> Value {
+    json!({"type":"string"})
+}
+
+pub fn response_schema(role: Role) -> Value {
+    let mut actions = vec![
+        action("fetch", json!({"reference":reference(None)})),
+        action("put_artifact", json!({"content_base64":text()})),
+        action("finish", json!({})),
+    ];
+    if role == Role::Reviewer {
+        actions.push(action("review_claim", json!({"claim_ref":reference(Some("CLAIM")),"verdict":{"type":"string","enum":["SUPPORTS","CONTRADICTS","INCONCLUSIVE"]},"rationale_ref":reference(Some("ARTIFACT"))})));
+    } else {
+        let values = [
+            ("ref", reference(None)),
+            ("text", text()),
+            ("integer", json!({"type":"integer"})),
+            ("boolean", json!({"type":"boolean"})),
+            (
+                "decimal",
+                record(json!({"mantissa":{"type":"integer"},"exponent":{"type":"integer"}})),
+            ),
+        ]
+        .into_iter()
+        .map(|(tag, value)| record(json!({"type":{"type":"string","enum":[tag]},"value":value})))
+        .collect::<Vec<_>>();
+        actions.push(action("emit_claim", json!({"predicate_ref":reference(Some("PREDICATE_DEF")),"arguments":list(json!({"anyOf":values})),"polarity":{"type":"boolean"}})));
+        actions.push(action("emit_assumption", json!({"question":text(),"chosen":text(),"alternatives":list(text()),"rationale_ref":reference(Some("ARTIFACT")),"artifacts":list(reference(Some("ARTIFACT")))})));
+        actions.push(action("emit_delta", json!({"path":text(),"base_ref":reference(Some("ARTIFACT")),"patch_ref":reference(Some("ARTIFACT")),"codec":{"type":"string","enum":["REPLACEMENT","UNIFIED_DIFF"]},"result_ref":reference(Some("ARTIFACT")),"assumptions":list(reference(Some("ASSUMPTION")))})));
+        actions.push(action("emit_fail", json!({"code":{"type":"string","enum":["PROVIDER_UNAVAILABLE","SANDBOX_UNAVAILABLE","IO_FAILURE","INVALID_AGENT_OUTPUT","INVALID_GOAL","CONFLICTING_OBLIGATIONS","CAPABILITY_DENIED","TOKEN_BUDGET","CALL_BUDGET","TIME_BUDGET","MISSING_REFERENCE","INVALIDATED_REFERENCE","RUNTIME_ERROR"]},"diagnostic_ref":reference(Some("ARTIFACT"))})));
+    }
+    record(json!({"action":{"anyOf":actions}}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn accounting_partition_covers_exact_bytes_and_requires_identical_declarations() {
+        let schema = response_schema(Role::Worker);
+        let mut shared = schema.clone();
+        shared["properties"]["action"]["anyOf"]
+            .as_array_mut()
+            .unwrap()
+            .truncate(3);
+        let parts = accounting_parts(&schema, &shared).unwrap();
+        assert_eq!(
+            parts.iter().map(|p| p.text.as_str()).collect::<String>(),
+            schema.to_string()
+        );
+        assert_eq!(parts.iter().filter(|p| p.protocol_only).count(), 4);
+        assert!(!parts[1].protocol_only);
+        // Same tool name with a changed signature is no longer a shared schema.
+        shared["properties"]["action"]["anyOf"][0]["description"] = "different".into();
+        let parts = accounting_parts(&schema, &shared).unwrap();
+        assert!(parts[1].protocol_only);
+        assert!(!parts[2].protocol_only);
+        shared["description"] = "different envelope".into();
+        let parts = accounting_parts(&schema, &shared).unwrap();
+        assert!(parts[0].protocol_only);
+        assert!(parts.last().unwrap().protocol_only);
+        assert!(accounting_parts(&json!({}), &shared).is_err());
+    }
+}

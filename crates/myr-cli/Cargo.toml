@@ -1,0 +1,25 @@
+[package]
+name = "myr-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "myr"
+path = "src/main.rs"
+
+[dependencies]
+myr-core.workspace = true
+myr-wire.workspace = true
+myr-cas.workspace = true
+myr-graph.workspace = true
+myr-runner.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

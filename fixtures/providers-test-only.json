@@ -1,0 +1,22 @@
+{
+  "planner": {
+    "backend": {"kind": "claude-code", "executable": "never-spawned"},
+    "model": "fixture",
+    "lineage": {"provider_id": "anthropic", "family_id": "fixture", "checkpoint_id": "v0", "procedure_id": "test"}
+  },
+  "worker": {
+    "backend": {"kind": "claude-code", "executable": "never-spawned"},
+    "model": "fixture",
+    "lineage": {"provider_id": "anthropic", "family_id": "fixture", "checkpoint_id": "v0", "procedure_id": "test"}
+  },
+  "reviewer_a": {
+    "backend": {"kind": "claude-code", "executable": "never-spawned"},
+    "model": "fixture",
+    "lineage": {"provider_id": "anthropic", "family_id": "fixture", "checkpoint_id": "v0", "procedure_id": "test"}
+  },
+  "reviewer_b": {
+    "backend": {"kind": "codex-cli", "executable": "never-spawned"},
+    "model": "fixture",
+    "lineage": {"provider_id": "openai", "family_id": "other-fixture", "checkpoint_id": "v0", "procedure_id": "test"}
+  }
+}

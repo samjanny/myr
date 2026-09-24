@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = ["crates/myr-core", "crates/myr-wire", "crates/myr-cas", "crates/myr-graph", "crates/myr-adapter", "crates/myr-runner", "crates/myr-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+
+[workspace.dependencies]
+myr-core = { path = "crates/myr-core" }
+myr-wire = { path = "crates/myr-wire" }
+myr-cas = { path = "crates/myr-cas" }
+myr-graph = { path = "crates/myr-graph" }
+myr-runner = { path = "crates/myr-runner" }
+myr-adapter = { path = "crates/myr-adapter" }
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+clap = { version = "4.6", features = ["derive"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+blake3 = "1"
+hex = "0.4"
+ciborium = "0.2"
+unicode-normalization = "0.1"
+tempfile = "3"
+tiktoken-rs = "=0.12.0"
+serde_yaml_ng = "=0.10.0"
+shlex = "=2.0.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
