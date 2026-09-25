@@ -15,8 +15,17 @@ Input fields are `schedule` (the complete `plan-benchmark` output), `receipts`,
 Measured outcome shape:
 
 ```json
-{"kind":"measured","run":{"oracle":"PASS","communication_tokens":123,"structured_output_failed":false}}
+{"kind":"measured","run":{"disposition":"DELIVERED","oracle":"PASS","communication_tokens":123,"structured_output_failed":false}}
+{"kind":"measured","run":{"disposition":"NO_DELIVERY","communication_tokens":123,"structured_output_failed":false}}
 ```
+
+A delivered run requires an oracle verdict; an undelivered run must not have
+one. `collection::classify_run` maps a finished mission to its disposition, and
+`myr run` prints it as `run_disposition`. Provider unavailability (including an
+exhausted subscription) is `unavailable/provider`. Sandbox, filesystem and
+runtime errors are `unavailable/infrastructure`. Otherwise an accepted candidate
+is DELIVERED and anything else, such as budget exhaustion, invalid output,
+capability denial, failing verifiers or reviewer rejection, is NO_DELIVERY.
 
 Unavailable outcome shape (the diagnostic CID is a placeholder):
 
@@ -25,7 +34,8 @@ Unavailable outcome shape (the diagnostic CID is a placeholder):
 ```
 
 The other unavailability reason is `infrastructure`. Measured oracles are PASS,
-HARMFUL or INVALID. INVALID makes the pair unavailable and is never reclassified.
+HARMFUL or INVALID. INVALID makes the pair unavailable and is never reclassified;
+NO_DELIVERY does not.
 Unknown fields, duplicate job receipts, foreign schedules and unplanned jobs
 are rejected. Receipts may arrive out of order; results are joined using the
 job's case, repetition, pipeline and condition, not receipt array position.

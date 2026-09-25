@@ -60,9 +60,11 @@ impl PreparedContext {
                     kind,
                     SegmentKind::Goal
                         | SegmentKind::DirectRepo
+                        | SegmentKind::LocalTool
                         | SegmentKind::MwRender
                         | SegmentKind::CasReferenced
                         | SegmentKind::InterAgentProse
+                        | SegmentKind::InterAgentArtifact
                 )
             }) {
                 return Err(

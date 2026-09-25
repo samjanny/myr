@@ -34,6 +34,9 @@ pub enum SegmentKind {
     DirectRepo,
     LocalTool,
     InterAgentProse,
+    /// Artifact content authored by another agent of the same mission, counted
+    /// by provenance in both pipelines regardless of repository or CAS access.
+    InterAgentArtifact,
     MwRender,
     CasReferenced,
     ValidationFeedback,
@@ -43,7 +46,7 @@ pub enum SegmentKind {
 impl SegmentKind {
     fn communication(self, pipeline: Pipeline) -> Result<bool> {
         match (pipeline, self) {
-            (Pipeline::Prose, Self::InterAgentProse) => Ok(true),
+            (Pipeline::Prose, Self::InterAgentProse) | (_, Self::InterAgentArtifact) => Ok(true),
             (
                 Pipeline::Mw0,
                 Self::MwRender
@@ -82,7 +85,7 @@ pub struct CallRecord {
     pub cas_context_bytes: u64,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Totals {
     pub context_reference_tokens: u64,
     pub communication_reference_tokens: u64,
@@ -145,9 +148,11 @@ impl Ledger {
                     s.kind,
                     SegmentKind::Goal
                         | SegmentKind::DirectRepo
+                        | SegmentKind::LocalTool
                         | SegmentKind::MwRender
                         | SegmentKind::CasReferenced
                         | SegmentKind::InterAgentProse
+                        | SegmentKind::InterAgentArtifact
                 )
             }) {
                 return Err(invalid("CAS context index must refer to retrieved content").into());

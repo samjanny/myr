@@ -1,6 +1,6 @@
 ## Appendix A — lineage-v0
 
-Two LLM EVIDENCE objects have different lineages only if both their producer and model family differ. *Written by ChatGPT.*
+Two LLM EVIDENCE objects have different lineages only if both their producer and model family differ.
 
 ### A.1 Fields
 

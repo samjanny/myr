@@ -11,6 +11,7 @@ use myr_adapter::{
 use myr_core::{FailCode, ObjectRef};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use std::{
     io::Write,
@@ -73,6 +74,8 @@ pub struct Dispatcher {
     checkpoint: Option<ObjectRef>,
     checkpoint_sequence: u64,
     audit_failed: bool,
+    /// First agent that authored each artifact in this mission (Appendix C.1).
+    artifact_origins: BTreeMap<ObjectRef, String>,
 }
 
 impl Dispatcher {
@@ -100,6 +103,7 @@ impl Dispatcher {
             checkpoint: None,
             checkpoint_sequence: 0,
             audit_failed: false,
+            artifact_origins: BTreeMap::new(),
         })
     }
     pub fn journal_directory(&self) -> &Path {
@@ -115,6 +119,7 @@ impl Dispatcher {
                 "format":"myr-dispatch-journal-v0", "sequence":self.checkpoint_sequence,
                 "previous":self.checkpoint, "pending":self.pending, "attempts":self.attempts,
                 "budget":self.budget.ledger(), "accounting":self.accounting,
+                "artifact_origins":self.artifact_origins.iter().collect::<Vec<_>>(),
             }))?;
             let reference = self.audit.put_artifact(&bytes)?;
             let mut pointer = tempfile::NamedTempFile::new_in(&self.journal_dir)?;
@@ -157,6 +162,39 @@ impl Dispatcher {
     }
     pub fn attempts(&self) -> &[Attempt] {
         &self.attempts
+    }
+
+    /// Record that `agent` authored an artifact. The first author is retained;
+    /// identical bytes produced later by another agent keep that provenance.
+    pub fn record_artifact_origin(&mut self, agent: &str, reference: ObjectRef) {
+        if reference.kind == myr_core::Kind::Artifact {
+            self.artifact_origins
+                .entry(reference)
+                .or_insert_with(|| agent.into());
+        }
+    }
+
+    /// Classify artifact content by provenance, not by retrieval channel:
+    /// initial repository bytes are DIRECT_REPO, the agent's own artifacts are
+    /// LOCAL_TOOL, another agent's are INTER_AGENT_ARTIFACT. Any other artifact
+    /// (runtime/protocol records) is `other`.
+    pub fn classify_artifact(
+        &self,
+        agent: &str,
+        reference: ObjectRef,
+        repository: &BTreeSet<ObjectRef>,
+        other: accounting::SegmentKind,
+    ) -> accounting::SegmentKind {
+        use accounting::SegmentKind;
+        if repository.contains(&reference) {
+            SegmentKind::DirectRepo
+        } else {
+            match self.artifact_origins.get(&reference) {
+                Some(origin) if origin == agent => SegmentKind::LocalTool,
+                Some(_) => SegmentKind::InterAgentArtifact,
+                None => other,
+            }
+        }
     }
 
     /// Record logical agent CAS traffic separately from injected-context tokens.
@@ -388,6 +426,64 @@ mod tests {
         ));
         assert_eq!(d.accounting().calls().len(), 1);
     }
+    #[test]
+    fn artifact_content_is_classified_by_provenance_not_retrieval_channel() {
+        use accounting::SegmentKind::*;
+        let dir = tempfile::tempdir().unwrap();
+        let mut d = Dispatcher::new(
+            Limits {
+                calls: 1,
+                reference_tokens: 1000,
+                elapsed: Duration::from_secs(30),
+            },
+            accounting::Pipeline::Prose,
+            myr_cas::Store::open(dir.path()).unwrap(),
+        )
+        .unwrap();
+        let artifact =
+            |b: u8| ObjectRef::new(myr_core::Kind::Artifact, myr_wire::artifact_cid(&[b]));
+        let repository = BTreeSet::from([artifact(0)]);
+        d.record_artifact_origin("Worker", artifact(1));
+        // The first author is retained even if another agent emits equal bytes.
+        d.record_artifact_origin("ReviewerA", artifact(1));
+        d.record_artifact_origin("ReviewerA", artifact(0));
+        let classify =
+            |agent, b| d.classify_artifact(agent, artifact(b), &repository, CasReferenced);
+        assert_eq!(classify("ReviewerA", 0), DirectRepo);
+        assert_eq!(classify("Worker", 1), LocalTool);
+        assert_eq!(classify("ReviewerA", 1), InterAgentArtifact);
+        assert_eq!(classify("ReviewerA", 2), CasReferenced);
+        // Inter-agent artifacts count in both pipelines; the others never do.
+        for pipeline in [accounting::Pipeline::Prose, accounting::Pipeline::Mw0] {
+            let tokenizer = ReferenceTokenizer::new().unwrap();
+            let mut ledger = accounting::Ledger::new(pipeline);
+            ledger
+                .record_call(
+                    &tokenizer,
+                    "ReviewerA",
+                    &[
+                        accounting::Segment {
+                            kind: InterAgentArtifact,
+                            text: "worker bytes",
+                        },
+                        accounting::Segment {
+                            kind: DirectRepo,
+                            text: "base bytes",
+                        },
+                        accounting::Segment {
+                            kind: LocalTool,
+                            text: "own bytes",
+                        },
+                    ],
+                )
+                .unwrap();
+            assert_eq!(
+                ledger.totals().communication_reference_tokens,
+                tokenizer.count("worker bytes")
+            );
+        }
+    }
+
     #[test]
     fn unknown_output_stops_future_dispatch_and_preserves_uncertainty() {
         let dir = tempfile::tempdir().unwrap();

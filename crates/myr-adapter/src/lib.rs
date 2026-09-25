@@ -10,7 +10,12 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use myr_core::*;
 use myr_graph::{Authority, Graph};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fs, io::Write, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    io::Write,
+    path::PathBuf,
+};
 
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const MAX_ARTIFACT_BYTES: usize = 512 * 1024;
@@ -152,6 +157,10 @@ pub struct Session {
     repair_errors: u8,
     ended: bool,
     review_context: Option<ObjectRef>,
+    /// Harness-private source view, never stored in shared CAS or the graph.
+    private: BTreeMap<ObjectRef, Vec<u8>>,
+    /// Private files absent from the shared baseline; they cannot be republished.
+    private_only: BTreeSet<ObjectRef>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -213,7 +222,32 @@ impl Session {
             repair_errors: 0,
             ended: false,
             review_context: None,
+            private: BTreeMap::new(),
+            private_only: BTreeSet::new(),
         })
+    }
+
+    /// Bind the primary-condition source view to a planner source pass. The
+    /// bytes are served only to this session; while bound, the session reads no
+    /// other repository artifact, and it cannot publish a private-only file.
+    pub fn bind_private_view(&mut self, files: BTreeMap<ObjectRef, Vec<u8>>) -> Result<(), Error> {
+        if self.role != Role::Planner || !self.private.is_empty() || self.ended || files.is_empty()
+        {
+            return Err(invalid("private view cannot be bound in this session").into());
+        }
+        for (reference, bytes) in &files {
+            if reference.kind != Kind::Artifact || myr_wire::artifact_cid(bytes) != reference.cid {
+                return Err(invalid("private view reference does not identify its bytes").into());
+            }
+        }
+        let shared: BTreeSet<_> = self.baseline.values().copied().collect();
+        self.private_only = files
+            .keys()
+            .filter(|r| !shared.contains(r))
+            .copied()
+            .collect();
+        self.private = files;
+        Ok(())
     }
 
     /// The runner validates the typed candidate context before binding it.
@@ -332,7 +366,18 @@ impl Session {
         let mut done = false;
         let mut fetched_raw_bytes = None;
         match action {
+            Action::Fetch { reference } if self.private.contains_key(&reference) => {
+                // Private repository read: not shared CAS traffic.
+                result = serde_json::json!({"reference":reference,"content_base64":STANDARD.encode(&self.private[&reference])});
+            }
             Action::Fetch { reference } => {
+                if !self.private.is_empty()
+                    && reference.kind == Kind::Artifact
+                    && reference != self.task.instruction
+                    && !self.roots[1..].contains(&reference)
+                {
+                    return Err(invalid("a source pass reads only its private view").into());
+                }
                 let bytes = self.accessible(graph, reference)?;
                 fetched_raw_bytes = Some(bytes.len() as u64);
                 result = if matches!(reference.kind, Kind::Artifact | Kind::Goal) {
@@ -350,6 +395,16 @@ impl Session {
                     return Err(
                         invalid("artifact exceeds size limit or has noncanonical Base64").into(),
                     );
+                }
+                let cid = myr_wire::artifact_cid(&bytes);
+                if self
+                    .private_only
+                    .contains(&ObjectRef::new(Kind::Artifact, cid))
+                {
+                    return Err(invalid(
+                        "artifact duplicates a private source file; quote the relevant text instead",
+                    )
+                    .into());
                 }
                 objects.push(graph.register_artifact(&bytes)?);
             }

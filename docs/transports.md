@@ -39,6 +39,44 @@ post-response rejection of native-tool events alone is not a security sandbox.
 - Declared Rust minimum is 1.88 because of resolved dependency requirements;
   tests ran with Rust 1.95.0 on Windows. Minimum-version and Linux checks remain.
 
+## Evidence on 2026-09-25 (Linux)
+
+- Installed: Claude Code 2.1.282 (Max subscription, `claude.ai` first-party
+  auth) and Codex CLI 0.157.0 (ChatGPT login). Runs used `--subscription-only`,
+  and no API key was present in the environment.
+- Claude Code (`claude-sonnet-5`) completed planner, worker and reviewer calls
+  in live missions. It produced structured actions of every role variant
+  exercised: `submit_goal`, `define_atom`, `put_rationale`, `fetch`,
+  `put_artifact`, `emit_claim`, `emit_delta`, `review_claim`, the prose-baseline
+  actions and `finish`.
+- Codex CLI 0.157 needed three compatibility fixes, all found before any
+  billable request succeeded:
+  - `features.rollout_budget.reminder_at_remaining_tokens` is now mandatory.
+    Myr sets it to the empty list, so no reminder text enters the model context
+    outside Myr's accounting.
+  - The rollout budget is an under-development feature, and Codex reports its
+    advisory as an `error` item, which the strict parser correctly rejected.
+    Myr now sets `suppress_unstable_features_warning=true`.
+  - An expired Codex refresh token still reported "Logged in using ChatGPT" in
+    `codex login status`. The failed turn's `unauthorized (401)` is now
+    reported as an authentication failure. The owner re-authenticated
+    interactively.
+- A replay of the recorded reviewer-B context through the corrected arguments
+  returned a clean event stream with one valid Myr action.
+- In live MW/0 missions Codex sometimes emitted several `agent_message` items in
+  one turn. `--output-schema` constrains only the final response, and earlier
+  messages are commentary. The parser now takes the message marked
+  `final_answer`, or otherwise the last message not marked `commentary`.
+  Commentary is never applied as an action. Two explicit final answers, or
+  commentary alone, are rejected.
+- The `cli_replay` example (subscription backends only) replays a request
+  reconstructed from a private dispatch journal, for transport diagnosis.
+- CLI failures now carry a closed diagnostic in private attempt records: the
+  Claude result subtype and API status, or the Codex failure class. Free-text
+  provider output is not retained. Claude's
+  `error_max_structured_output_retries` is classified as INVALID_AGENT_OUTPUT
+  (a structured-output failure), not provider unavailability.
+
 The Claude smoke example requires an explicit executable and model and consumes
 subscription usage when run. It is not part of automated tests. Full mission
 budgets, provider compatibility across every action variant, live Codex/API

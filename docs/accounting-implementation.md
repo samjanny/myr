@@ -21,8 +21,18 @@ token spellings in untrusted text are encoded as ordinary literal text, equivale
 to Python `encode(text, disallowed_special=())`, not interpreted as control tokens.
 This explicit rule must remain fixed across both pipelines.
 
-The prose ledger accepts INTER_AGENT_PROSE as communication. MW/0 accepts
-MW_RENDER, CAS_REFERENCED, VALIDATION_FEEDBACK and PROTOCOL_SCHEMA. Both exclude
+The prose ledger accepts INTER_AGENT_PROSE and INTER_AGENT_ARTIFACT as
+communication. MW/0 accepts INTER_AGENT_ARTIFACT, MW_RENDER, CAS_REFERENCED,
+VALIDATION_FEEDBACK and PROTOCOL_SCHEMA. Artifact content is classified by
+provenance (specification revision 1). The mission dispatcher records the
+first agent to author each artifact. `Dispatcher::classify_artifact` returns:
+
+- DIRECT_REPO for initial repository bytes, however they are fetched;
+- LOCAL_TOOL for the agent's own artifacts;
+- INTER_AGENT_ARTIFACT for another agent's artifacts;
+- CAS_REFERENCED for other referenced runtime or protocol records.
+
+The authorship map is journaled. Both exclude
 SYSTEM, GOAL, DIRECT_REPO and LOCAL_TOOL from communication while retaining their
 full-context counts for budgets. Mixing pipeline-only categories is rejected
 without appending a partial call. CAS reads increment only raw bytes; inserted
@@ -59,12 +69,13 @@ the baseline's shared schema using `schema::accounting_parts`. Only byte-identic
 action declarations are exempt; a matching tool name is insufficient. The JSON
 envelope is exempt only when identical, and each comma belongs to its following
 action. Concatenating all retained fragments reproduces the compact schema
-exactly. The concrete baseline schema must still be implemented and frozen;
-tests use explicitly constructed shared declarations, not a completed baseline.
+exactly. The shared schema is `schema::prose_shared_schema()`, the union of the
+[prose baseline](prose-baseline.md) declarations. Only `fetch`, `put_artifact` and
+`finish` are byte-identical to MW/0 declarations and therefore exempt.
 
 Tests cover known token IDs, literal special-token text, prevention of merges
 across segment boundaries, repeated schemas, pipeline classification, and binary
 CAS representation accounting, exact retained context reconstruction and absence
 of implicit history and exact shared-versus-protocol schema partitioning.
-Full tokenizer differential validation, concrete baseline schema,
-live acceptance of runner/budget integration, and the official frozen manifest remain pending.
+Full tokenizer differential validation, pilot validation and freeze of the
+baseline schema, live acceptance of runner/budget integration, and the official frozen manifest remain pending.

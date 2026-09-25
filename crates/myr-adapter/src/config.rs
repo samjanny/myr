@@ -54,6 +54,23 @@ impl RoleProviders {
         self.worker.validate()?;
         validate_reviewers(&self.reviewer_a, &self.reviewer_b)
     }
+    /// Reject every separately billed API backend. Used when the operator has
+    /// authorized only existing Claude Code / Codex CLI subscription sessions.
+    pub fn require_subscription(&self) -> Result<(), ValidationError> {
+        for slot in [
+            RoleSlot::Planner,
+            RoleSlot::Worker,
+            RoleSlot::ReviewerA,
+            RoleSlot::ReviewerB,
+        ] {
+            if !self.get(slot).subscription() {
+                return Err(invalid(
+                    "subscription-only run rejects separately billed API backends",
+                ));
+            }
+        }
+        Ok(())
+    }
     pub fn get(&self, slot: RoleSlot) -> &ProviderConfig {
         match slot {
             RoleSlot::Planner => &self.planner,

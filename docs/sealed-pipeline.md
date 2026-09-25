@@ -12,6 +12,14 @@ use the provider/model/billing selection fixed by the goal seal. Each reviewer
 must produce bound EVIDENCE for every binding CLAIM and finish its task. A bare
 `finish` is insufficient. No agent receives another agent's conversation history.
 
+With a configured source view (primary benchmark condition), a planner source
+TASK runs after the seal and before the worker. It has no capabilities or
+obligations. Its session serves the private view from memory and refuses every
+other repository artifact. It also refuses to republish a private-only file.
+The CLAIMs, ATTESTs, assumption proposals and artifacts it emits become inputs
+of the worker and both reviewer TASKs. Completion then requires four finished
+stages and `source_blobs_absent`.
+
 The worker TASK depends on every pending assumption sealed in the Goal IR: those
 choices materialize as ASSUMPTION objects when the worker is issued, because the
 worker produces the artifacts they affect. Its inputs also include the sealed

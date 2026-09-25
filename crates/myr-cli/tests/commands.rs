@@ -48,7 +48,7 @@ fn benchmark_plan_is_reproducible_and_does_not_execute_jobs() {
 #[test]
 fn benchmark_analysis_reports_numerical_bounds_without_official_acceptance() {
     let dir = tempfile::tempdir().unwrap();
-    let run = |oracle, tokens| serde_json::json!({"oracle":oracle,"communication_tokens":tokens,"structured_output_failed":false});
+    let run = |oracle, tokens| serde_json::json!({"disposition":"DELIVERED","oracle":oracle,"communication_tokens":tokens,"structured_output_failed":false});
     let repetition = serde_json::json!({
         "prose":{"clean":run("PASS",100),"poisoned":run("HARMFUL",100)},
         "myr":{"clean":run("PASS",50),"poisoned":run("PASS",50)}
@@ -317,8 +317,85 @@ fn run_preparation_preserves_bytes_and_failed_execution_records_partial() {
         serde_json::from_slice(&audit.get(private_record).unwrap()).unwrap();
     let mut public = result.clone();
     public.as_object_mut().unwrap().remove("private_record");
+    // Absent provider executable: unavailable, not a valid NO_DELIVERY run.
+    assert_eq!(
+        public
+            .as_object_mut()
+            .unwrap()
+            .remove("run_disposition")
+            .unwrap(),
+        serde_json::json!({"kind":"UNAVAILABLE","reason":"provider"})
+    );
     assert_eq!(immutable, public);
     assert!(run_root.join("result.json").is_file());
+    assert_eq!(
+        std::fs::read(repo.join("file.bin")).unwrap(),
+        [0, 255, 13, 10]
+    );
+}
+
+#[test]
+fn prose_baseline_run_records_partial_without_delivery_or_fallback() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repository");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::write(repo.join("file.bin"), [0, 255, 13, 10]).unwrap();
+    let mission = dir.path().join("myr.yaml");
+    std::fs::write(&mission, "goal: Preserve behavior\nverify: [cargo test]\n").unwrap();
+    let config = dir.path().join("runtime.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&runtime_config(dir.path())).unwrap(),
+    )
+    .unwrap();
+    let run_root = dir.path().join("prose-run");
+    // Nonexistent absolute executables: the first planner call fails and no
+    // other backend is attempted. No model quota or Docker is used.
+    let output = myr()
+        .arg("run")
+        .arg(&mission)
+        .arg("--config")
+        .arg(&config)
+        .arg("--repository")
+        .arg(&repo)
+        .arg("--root")
+        .arg(&run_root)
+        .arg("--pipeline")
+        .arg("prose")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let report = &result["report"];
+    assert_eq!(
+        result["run_disposition"],
+        serde_json::json!({"kind":"UNAVAILABLE","reason":"provider"})
+    );
+    assert_eq!(report["format"], "myr-prose-pipeline-v0");
+    assert_eq!(report["state"], "PARTIAL");
+    assert_eq!(report["delivered"], false);
+    assert_eq!(report["budget"]["calls_started"], 1);
+    assert_eq!(report["stages"].as_array().unwrap().len(), 1);
+    assert_eq!(report["accounting"]["communication_reference_tokens"], 0);
+    let prepared: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(run_root.join("prepared.json")).unwrap()).unwrap();
+    assert_eq!(prepared["pipeline"], "prose");
+    let graph = Graph::open(
+        run_root.join("graph.sqlite"),
+        myr_cas::Store::open(run_root.join("objects")).unwrap(),
+    )
+    .unwrap();
+    let failure: ObjectRef = serde_json::from_value(report["failures"][0].clone()).unwrap();
+    let Object::Fail(fail) = graph.get(failure).unwrap() else {
+        panic!("missing failure")
+    };
+    assert_eq!(fail.code, myr_core::FailCode::ProviderUnavailable);
+    let audit = myr_cas::Store::open(run_root.join("private-audit")).unwrap();
+    let private_record: ObjectRef =
+        serde_json::from_value(result["private_record"].clone()).unwrap();
+    let immutable: serde_json::Value =
+        serde_json::from_slice(&audit.get(private_record).unwrap()).unwrap();
+    assert_eq!(&immutable, report);
     assert_eq!(
         std::fs::read(repo.join("file.bin")).unwrap(),
         [0, 255, 13, 10]
@@ -795,4 +872,43 @@ fn read_command_does_not_create_a_missing_store() {
         .unwrap();
     assert!(!output.status.success());
     assert!(!root.exists());
+}
+
+#[test]
+fn subscription_only_rejects_api_backends_before_creating_a_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repository");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::write(repo.join("file.bin"), b"x").unwrap();
+    let mission = dir.path().join("myr.yaml");
+    std::fs::write(&mission, "goal: Preserve behavior\nverify: [cargo test]\n").unwrap();
+    let mut value = runtime_config(dir.path());
+    value["providers"]["planner"]["backend"] =
+        serde_json::json!({"kind":"anthropic-api","api_key_env":"MYR_TEST_UNUSED_KEY"});
+    let config = dir.path().join("runtime.json");
+    std::fs::write(&config, serde_json::to_vec(&value).unwrap()).unwrap();
+    let root = dir.path().join("store");
+    let run = |subscription_only: bool| {
+        let mut command = myr();
+        command
+            .arg("run")
+            .arg(&mission)
+            .arg("--config")
+            .arg(&config)
+            .arg("--repository")
+            .arg(&repo)
+            .arg("--root")
+            .arg(&root)
+            .arg("--prepare-only");
+        if subscription_only {
+            command.arg("--subscription-only");
+        }
+        command.output().unwrap()
+    };
+    let output = run(true);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("subscription-only"));
+    assert!(!root.exists());
+    // Without the guard the same explicit API selection is still allowed.
+    assert!(run(false).status.success());
 }

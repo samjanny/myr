@@ -16,6 +16,12 @@ struct Args {
     command: Command,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Pipeline {
+    Mw0,
+    Prose,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Join receipts to a benchmark plan and report missing or invalid pairs.
@@ -43,6 +49,16 @@ enum Command {
         /// Prepare the snapshot, catalog and policy without provider or tool calls.
         #[arg(long)]
         prepare_only: bool,
+        /// Communication protocol: MW/0, or the natural-language benchmark baseline.
+        #[arg(long, value_enum, default_value = "mw0")]
+        pipeline: Pipeline,
+        /// Primary benchmark condition: private source view read only by the
+        /// planner's source pass after its plan is frozen.
+        #[arg(long)]
+        source_view: Option<PathBuf>,
+        /// Refuse any separately billed API backend before creating the store.
+        #[arg(long)]
+        subscription_only: bool,
     },
     /// Import a repository baseline into a new store without invoking agents.
     Snapshot {
@@ -137,6 +153,9 @@ fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             repository,
             root,
             prepare_only,
+            pipeline,
+            source_view,
+            subscription_only,
         } => 'run: {
             if root.exists() {
                 return Err("run output store must be a new directory".into());
@@ -159,7 +178,14 @@ fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             };
             let config: myr_runner::setup::Config = serde_json::from_slice(&read_config(&config)?)?;
             config.validate(&mission)?;
+            if subscription_only {
+                config.providers.require_subscription()?;
+            }
             let tree = myr_runner::snapshot::read(&repository, &config.read_policy)?;
+            let source_tree = source_view
+                .as_ref()
+                .map(|path| myr_runner::snapshot::read(path, &config.read_policy))
+                .transpose()?;
             let mut graph = create_run_store(&root)?;
             let mut prepared = myr_runner::setup::prepare(
                 &mut graph,
@@ -168,14 +194,43 @@ fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                 &config,
                 &root.join("quarantine"),
             )?;
+            if let Some(source_tree) = source_tree {
+                myr_runner::setup::attach_source(&mut graph, &mut prepared, source_tree)?;
+            }
             let preparation = serde_json::json!({"format":"myr-preparation-v0","mission":mission,"configuration":prepared.configuration,
-                "policy":prepared.policy,"measurement_procedures":prepared.measurement_procedures,"planner_schema":prepared.catalog.response_schema(&mission)});
+                "policy":prepared.policy,"measurement_procedures":prepared.measurement_procedures,"planner_schema":prepared.catalog.response_schema(&mission),
+                "pipeline":if pipeline == Pipeline::Prose { "prose" } else { "mw0" },
+                "source_view":source_view.is_some(),"subscription_only":subscription_only});
             std::fs::write(
                 root.join("prepared.json"),
                 serde_json::to_vec_pretty(&preparation)?,
             )?;
             if prepare_only {
                 serde_json::json!({"prepared":true,"executed":false,"root":root,"configuration":prepared.configuration,"baseline":prepared.policy.baseline})
+            } else if pipeline == Pipeline::Prose {
+                let audit = myr_cas::Store::open(root.join("private-audit"))?;
+                let acceptance = myr_runner::prose::seal_acceptance(
+                    &mut graph,
+                    &mission,
+                    &prepared.policy,
+                    &prepared.registry,
+                    &prepared.command_atoms,
+                )?;
+                let outcome = myr_runner::prose::run(
+                    &mut graph,
+                    &audit,
+                    &mission,
+                    acceptance.reference(),
+                    &prepared.prose,
+                )?;
+                mission_failed = !outcome.report.delivered;
+                let disposition = myr_runner::collection::classify_run(
+                    outcome.report.delivered,
+                    &failure_codes(&graph, &outcome.report.failures)?,
+                );
+                let value = serde_json::json!({"run_disposition":disposition,"private_record":outcome.private_record,"report":outcome.report});
+                std::fs::write(root.join("result.json"), serde_json::to_vec_pretty(&value)?)?;
+                value
             } else {
                 let audit = myr_cas::Store::open(root.join("private-audit"))?;
                 let outcome = myr_runner::pipeline::plan_and_run(
@@ -196,15 +251,24 @@ fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                             myr_core::MissionState::Complete
                                 | myr_core::MissionState::CompleteWithAssumptions
                         );
-                        serde_json::json!({"planning_created":planning_created,"private_record":outcome.private_record,"report":outcome.report})
+                        let disposition = myr_runner::collection::classify_run(
+                            !mission_failed,
+                            &failure_codes(&graph, &outcome.report.failures)?,
+                        );
+                        serde_json::json!({"run_disposition":disposition,"planning_created":planning_created,"private_record":outcome.private_record,"report":outcome.report})
                     }
                     myr_runner::pipeline::MissionOutcome::PlanningFailed {
                         report,
                         private_record,
                     } => {
                         mission_failed = true;
+                        let disposition = myr_runner::collection::classify_run(
+                            false,
+                            &failure_codes(&graph, &[report.failure])?,
+                        );
                         let mut value = serde_json::to_value(report)?;
                         value["private_record"] = serde_json::to_value(private_record)?;
+                        value["run_disposition"] = serde_json::to_value(disposition)?;
                         value
                     }
                 };
@@ -303,6 +367,19 @@ fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     Ok(())
+}
+
+fn failure_codes(
+    graph: &Graph,
+    failures: &[myr_core::ObjectRef],
+) -> Result<Vec<myr_core::FailCode>, Box<dyn std::error::Error>> {
+    failures
+        .iter()
+        .map(|reference| match graph.get(*reference)? {
+            Object::Fail(fail) => Ok(fail.code),
+            _ => Err("failure reference is not a FAIL".into()),
+        })
+        .collect()
 }
 
 fn create_run_store(root: &Path) -> Result<Graph, Box<dyn std::error::Error>> {

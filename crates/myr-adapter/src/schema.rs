@@ -103,12 +103,68 @@ fn text() -> Value {
     json!({"type":"string"})
 }
 
-pub fn response_schema(role: Role) -> Value {
-    let mut actions = vec![
+/// Declarations offered identically by both pipelines. They are generated once
+/// so Myr and the prose baseline cannot drift apart byte by byte (Appendix C.4).
+fn shared_actions() -> Vec<Value> {
+    vec![
         action("fetch", json!({"reference":reference(None)})),
         action("put_artifact", json!({"content_base64":text()})),
         action("finish", json!({})),
-    ];
+    ]
+}
+
+/// Fixed-role slots addressed by prose-baseline messages, in pipeline order.
+pub const PROSE_RECIPIENTS: [&str; 3] = ["worker", "reviewer_a", "reviewer_b"];
+
+/// Frozen response schema of the natural-language baseline. It keeps the shared
+/// declarations and adds only baseline tools: a whole-file edit, prose messages
+/// to later pipeline stages, and a reviewer's final verdict. `recipients` must
+/// be a subset of [`PROSE_RECIPIENTS`] chosen by the runtime for the role.
+pub fn prose_response_schema(role: Role, recipients: &[&str]) -> Value {
+    let mut actions = shared_actions();
+    if !recipients.is_empty() {
+        actions.push(action(
+            "send_message",
+            json!({"to":list(json!({"type":"string","enum":recipients})),"text":text()}),
+        ));
+    }
+    match role {
+        Role::Worker => actions.push(action(
+            "write_file",
+            json!({"path":text(),"content_ref":reference(Some("ARTIFACT"))}),
+        )),
+        Role::Reviewer => actions.push(action(
+            "submit_review",
+            json!({"verdict":{"type":"string","enum":["APPROVE","REJECT"]},"message":text()}),
+        )),
+        Role::Planner => {}
+    }
+    record(json!({"action":{"anyOf":actions}}))
+}
+
+/// Union of every prose-baseline declaration. Myr passes it as the shared
+/// schema: only byte-identical declarations are exempt from PROTOCOL_SCHEMA.
+pub fn prose_shared_schema() -> Value {
+    let mut actions = Vec::new();
+    for (role, recipients) in [
+        (Role::Planner, &PROSE_RECIPIENTS[..]),
+        (Role::Worker, &PROSE_RECIPIENTS[1..]),
+        (Role::Reviewer, &[][..]),
+    ] {
+        for declaration in prose_response_schema(role, recipients)["properties"]["action"]["anyOf"]
+            .as_array()
+            .expect("prose schema actions")
+        {
+            if !actions.contains(declaration) {
+                actions.push(declaration.clone());
+            }
+        }
+    }
+    record(json!({"action":{"anyOf":actions}}))
+}
+
+pub fn response_schema(role: Role) -> Value {
+    let mut actions = shared_actions();
     if role == Role::Reviewer {
         actions.push(action("review_claim", json!({"claim_ref":reference(Some("CLAIM")),"verdict":{"type":"string","enum":["SUPPORTS","CONTRADICTS","INCONCLUSIVE"]},"rationale_ref":reference(Some("ARTIFACT"))})));
     } else {
@@ -161,5 +217,51 @@ mod tests {
         assert!(parts[0].protocol_only);
         assert!(parts.last().unwrap().protocol_only);
         assert!(accounting_parts(&json!({}), &shared).is_err());
+    }
+
+    #[test]
+    fn prose_baseline_shares_exactly_the_common_declarations_with_myr() {
+        let shared = prose_shared_schema();
+        for role in [Role::Worker, Role::Reviewer] {
+            let schema = response_schema(role);
+            let parts = accounting_parts(&schema, &shared).unwrap();
+            // Envelope and the three common tools are exempt; every MW/0
+            // declaration (emit_*, review_claim) remains protocol schema.
+            assert!(!parts[0].protocol_only && !parts.last().unwrap().protocol_only);
+            let exempt: Vec<_> = parts[1..parts.len() - 1]
+                .iter()
+                .map(|p| p.protocol_only)
+                .collect();
+            let expected_protocol = if role == Role::Worker { 4 } else { 1 };
+            assert_eq!(exempt[..3], [false, false, false]);
+            assert_eq!(exempt[3..].len(), expected_protocol);
+            assert!(exempt[3..].iter().all(|p| *p));
+        }
+        // Inside the baseline pipeline nothing is protocol schema.
+        let worker = prose_response_schema(Role::Worker, &PROSE_RECIPIENTS[1..]);
+        assert!(
+            accounting_parts(&worker, &worker)
+                .unwrap()
+                .iter()
+                .all(|p| !p.protocol_only)
+        );
+        let names: Vec<_> = shared["properties"]["action"]["anyOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["properties"]["tool"]["enum"][0].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "fetch",
+                "put_artifact",
+                "finish",
+                "send_message",
+                "send_message",
+                "write_file",
+                "submit_review"
+            ]
+        );
     }
 }

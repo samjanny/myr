@@ -79,7 +79,8 @@ or verifier calls. To execute, omit it and choose a **new** output directory.
 Execution consumes the selected subscription quota or API billing. See
 [runtime configuration](docs/run.md) and [measurement configuration](docs/measurements.md).
 The Docker verifier requires an available local Linux daemon and a pinned local
-image; Myr does not automatically pull an image.
+image; Myr does not automatically pull an image. Add `--pipeline prose` to run
+the [natural-language baseline](docs/prose-baseline.md) on the same preparation.
 
 Other commands:
 
@@ -115,6 +116,7 @@ experiment. No completed live mission or official effectiveness result is claime
 - [Architecture](docs/architecture.md)
 - [MW/0 schema](mw0.cddl) and [reference vectors](test-vectors/README.md)
 - [Sandbox execution](docs/sandbox-execution.md)
+- [Natural-language baseline](docs/prose-baseline.md)
 - [Benchmark schedule](docs/benchmark-schedule.md), [collection](docs/benchmark-collection.md)
   and [statistics](docs/benchmark-statistics.md)
 

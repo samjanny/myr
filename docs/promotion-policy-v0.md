@@ -1,6 +1,6 @@
 ## Appendix B — promotion-policy-v0
 
-A CLAIM becomes a FACT with favorable deterministic evidence and no contrary deterministic evidence, or with two favorable LLM lineages and no counterevidence or conflict. *Written by ChatGPT.*
+A CLAIM becomes a FACT with favorable deterministic evidence and no contrary deterministic evidence, or with two favorable LLM lineages and no counterevidence or conflict.
 
 The policy considers only valid, non-invalidated EVIDENCE applicable to the CLAIM's exact canonical scope. v0 does not reason across broader or narrower scopes.
 

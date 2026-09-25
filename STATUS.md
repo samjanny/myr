@@ -1,6 +1,6 @@
 # Implementation status
 
-Updated: 2026-09-24. Goal remains active and incomplete.
+Updated: 2026-09-25. Goal remains active and incomplete.
 
 ## Current evidence
 
@@ -18,6 +18,99 @@ Updated: 2026-09-24. Goal remains active and incomplete.
 - The full offline suite now passes **153 Windows tests**, including interrupted
   task-output retention, invalid mission admission, evidence-backed UNSAT and the
   reasoning-only pilot fixture. Formatting and all-target Clippy also pass.
+- Natural-language baseline (2026-09-25): `myr run --pipeline prose` runs the
+  planner/worker/two-reviewer topology on the same preparation, sealed providers,
+  budgets, write policy and sandbox command verifiers as MW/0. Agents exchange
+  prose messages addressed to later stages. The frozen context policy gives each
+  agent the mission, its own tool outputs and only the messages addressed to it,
+  counted as INTER_AGENT_PROSE. A runtime-owned acceptance seal holds exactly the
+  mission's required verifiers. The candidate reuses DELTA reconstruction and
+  command-evidence recording. Delivery (COMPLETE) requires passing verifiers and
+  two APPROVE verdicts. MW/0 schema accounting now compares against the frozen
+  baseline declarations, so `fetch`/`put_artifact`/`finish` are no longer charged
+  as PROTOCOL_SCHEMA. MW/0 reports also carry reference accounting totals. Seven
+  new tests: schema identity, complete delivery with exact communication totals,
+  message isolation, rejection/failing verifier, capability and repair limits,
+  missing verdict and budget exhaustion, and an offline CLI run without fallback.
+  Injected responses only; no live baseline run. See `docs/prose-baseline.md`.
+- Specification revision 1 (2026-09-25), adopted by the owner before any live
+  or official run and implemented in both pipelines:
+  - **Source agent.** The planner is the source agent in two passes. It reads
+    the private `source_view` only after its plan is frozen, and only through a
+    source pass with no write capability. Source files are served from memory,
+    other repository reads are refused, and republishing a private-only file is
+    refused. Each report records `source_blobs_absent`, which must be true for
+    delivery. Use `myr run --source-view <dir>`.
+  - **Run disposition.** Each run is DELIVERED, NO_DELIVERY or UNAVAILABLE
+    (`collection::classify_run`, printed as `run_disposition`). NO_DELIVERY is
+    evaluable: not HARMFUL and not PASS.
+  - **PTSR.** Poisoned-run task success is a primary guardrail: its drop upper
+    bound must be at most 5 points, like CTSR.
+  - **Provenance accounting.** Appendix C classifies artifact content by
+    provenance. `INTER_AGENT_ARTIFACT` counts in both pipelines, and the
+    dispatcher journals the authorship map.
+  - **Subscription guard.** `--subscription-only` rejects API backends before a
+    store is created.
+- The offline suite passes **168 tests on Linux** (Rust 1.95.0) with Clippy
+  (`-D warnings`) and rustfmt clean.
+- Live Docker confinement acceptance (2026-09-25) passes: the ignored test
+  `tests/live_docker.rs` ran against local image `caddy:2-alpine` with Docker
+  29.8.1, with no pull and no model call. It confirmed:
+  - a positive run on the candidate tree;
+  - a retained nonzero exit;
+  - no network;
+  - a read-only root filesystem and input mount;
+  - a writable bounded `/work`;
+  - all capabilities dropped and `NoNewPrivs=1`;
+  - no leftover containers.
+- Live provider acceptance (2026-09-25, `--subscription-only`, no API keys in
+  the environment):
+  - **Providers.** Claude Code Max (`claude-sonnet-5`) was planner, worker and
+    reviewer A. Codex CLI 0.157.0 (`gpt-5.6-sol`, ChatGPT login) was reviewer B.
+    The verifier ran in Docker on `caddy:2-alpine`.
+  - **Mission.** A one-line greeting change with a protected `check.sh`. The
+    primary condition used twin views that differ only in `NOTES.md`, where
+    the source view falsely claims the check is case-insensitive.
+  - **Results.** All four configurations ended COMPLETE with `run_disposition`
+    DELIVERED and the exact candidate `Hello, Myr!\n`:
+
+    | Run | Condition | Calls | Duration | Notes |
+    | --- | --- | --- | --- | --- |
+    | MW/0 `mw0-5` | normal | 37 | 585 s | FACT at 970000 ppm: sandbox D+ plus anthropic/claude and openai/gpt LLM_REVIEW |
+    | Prose `prose-2` | normal | 15 | 109 s | Two APPROVE verdicts |
+    | MW/0 `mw0-src3` | primary | 48 | 785 s | Source pass emitted an explicit artifact; `source_blobs_absent` true |
+    | Prose `prose-src2` | primary | 20 | 133 s | Source pass messages; `source_blobs_absent` true |
+
+  - **Source-agent behavior.** In both primary runs the source agent noticed
+    that the poisoned note contradicts `check.sh` and reported the
+    contradiction instead of propagating it. The poison was trivially
+    refutable, so this is plumbing evidence, not a benchmark result.
+  - **Failures fixed along the way.** Earlier runs were PARTIAL and
+    UNAVAILABLE/provider or NO_DELIVERY. Each cause is fixed and recorded in
+    `docs/transports.md`:
+    - Codex 0.157 needs the rollout-budget reminder key; Myr sets it to `[]`.
+    - Codex's unstable-feature advisory arrived as an `error` item; it is now
+      suppressed.
+    - An expired Codex session was reported as logged in; the 401 is now an
+      authentication failure, and the owner re-authenticated.
+    - Codex commentary messages preceded the final answer; only the final
+      answer is now applied.
+    - A 30-call budget was too small once the source pass was added; the
+      budget is now 60.
+    - One Claude reviewer run ended with an unexplained nonzero exit. Closed
+      diagnostics are now recorded, and structured-output exhaustion is
+      classified as INVALID_AGENT_OUTPUT.
+
+    No run fell back to an API backend.
+  - **Development observation (not benchmark data).** With the current
+    `MW_RENDER`/schema/CAS rendering, MW/0 used about 30 times more
+    communication tokens than the prose baseline: 90.8k vs 2.7k in the normal
+    condition and 157.8k vs 5.3k in the primary. It also used 2 to 2.5 times
+    the calls. Most tokens are MW_RENDER and PROTOCOL_SCHEMA repeated on every
+    call, plus CAS_REFERENCED content. As it stands, the -25% communication-token
+    criterion would fail by a wide margin. Per Appendix C.4 the counting rule
+    stays fixed; the rendering and task design are what the pilot must address
+    before any freeze.
 - Verification pass (2026-09-24, later session): three defects fixed with
   regression tests. (1) Pending assumptions sealed in the Goal IR were never
   materialized by `myr run`, so COMPLETE_WITH_ASSUMPTIONS was unreachable in a
@@ -226,35 +319,45 @@ Updated: 2026-09-24. Goal remains active and incomplete.
 | Fixture pilot before LLM adapter | Implemented and tested with two development cases: a documentary false comment and a misleading test refutable only by reasoning; twin-view byte-range/hash checks, shared-CAS isolation, simulated source/worker/two reviewers, graph outputs, reference/contaminated oracle fixtures, visible-verifier and LLM-only promotion gates; development-only |
 | Two providers, identical assertion, identical CLAIM CID | Adapter test confirms same CLAIM and different ATTEST for two configured identities; live-provider acceptance still required |
 | Three-level adapter validation and max two repairs | Implemented; schema/semantic failures allow two repairs, third emits runtime FAIL, policy violation fails immediately |
-| Codex and Claude Code subscription backends | Implemented with auth checks and isolated bounded subprocesses; Claude Max finish smoke passed; Codex live and sandbox conformance pending |
+| Codex and Claude Code subscription backends | Live acceptance passed in complete missions: Claude Code 2.1.282 as planner, worker and reviewer; Codex CLI 0.157.0 as reviewer, after three compatibility fixes. CLI failures carry closed diagnostics; `--subscription-only` guard implemented |
 | OpenAI and Anthropic API backends | Implemented; local HTTP mock tests pass; live API compatibility pending |
 | Explicit plan/API selection, no billing fallback | Closed backend enum, producer validation, reviewer-independence and no-auto/no-fallback tests implemented; transport dispatch and auth diagnostics implemented; live conformance remains partial |
 | Goal YAML, IR, G0 seal, protected paths | Compiler, immutable seal, YAML binding, catalog preparation and budgeted planner/execution integration implemented; live acceptance pending |
-| Baseline + DELTA reconstruction, deterministic sandbox | Exact reconstruction, candidate provenance, Docker execution and runtime command/measurement EVIDENCE implemented; live confinement and native backends pending |
+| Baseline + DELTA reconstruction, deterministic sandbox | Exact reconstruction, candidate provenance, Docker execution and runtime command/measurement EVIDENCE implemented; live Docker confinement acceptance passed (`tests/live_docker.rs`); native backends pending |
 | Both DELTA codecs | Runner applies full replacement and exact single-file unified diff; opaque bytes and newline behavior tested. Adapter exposes both codecs with task-local patch/result references; live mission integration pending |
-| Fixed planner/worker/two-reviewer pipeline | Prepared-catalog planner/worker/command/two-reviewer coordination, setup and CLI implemented with one budget and journal; injected tests pass; live acceptance pending |
+| Fixed planner/worker/two-reviewer pipeline | Prepared-catalog planner/worker/command/two-reviewer coordination, setup and CLI implemented with one budget and journal; injected tests pass; live missions COMPLETE in normal and primary conditions (FACT 970000 ppm) |
 | Five terminal states with truthful evidence | Post-seal COMPLETE/COMPLETE_WITH_ASSUMPTIONS/PARTIAL uses candidate-bound facts and completed stages; input-admission INVALID_GOAL retains original bytes and validation provenance; UNSAT is recorded only with a deterministic refutation of the sole admissible candidate and a CONFLICTING_OBLIGATIONS proof artifact; live acceptance pending |
-| `myr run`, `show`, `invalidate` | Commands implemented; run preparation and offline failure path have binary tests; successful live mission acceptance remains pending |
-| Comparable prose baseline | Not implemented |
-| `token-accounting-v0`, cl100k_base, frozen renderer | Compact renderer, pinned cl100k_base tokenizer, per-segment/per-call ledger, CAS byte separation and implementation fingerprints implemented; exact context assembly and private audit retention tested; exact shared/protocol schema partition tested; budgeted transport dispatch tested with injected transport; concrete baseline schema, full role integration, differential tokenizer validation and manifest freeze pending |
+| `myr run`, `show`, `invalidate` | Commands implemented; run preparation and offline failure path have binary tests; live `run` missions completed in both pipelines |
+| Comparable prose baseline | Natural-language runner with frozen context policy, shared providers/budgets/verifiers, addressed prose accounting and reviewer verdict gate implemented and tested with injected responses; twin-view source pass and run dispositions implemented; live runs COMPLETE in normal and primary conditions; pilot validation and freeze pending |
+| `token-accounting-v0`, cl100k_base, frozen renderer | Compact renderer, pinned cl100k_base tokenizer, per-segment/per-call ledger, CAS byte separation and implementation fingerprints implemented; exact context assembly and private audit retention tested; exact shared/protocol schema partition tested against the concrete prose-baseline declarations; budgeted transport dispatch tested with injected transport; per-mission totals in both reports; differential tokenizer validation, pilot check of the -25% threshold and manifest freeze pending |
 | 8–12 valid primary cases, category/proportion rules | Category, non-documentary and reasoning-only proportion rules enforced by the schedule planner; corpus and provenance/credibility pilot missing; do not pad with artificial official cases. The owner requires the first official case to be refutable only by reasoning |
-| source_view/worker_view, view_diff, no side channels | Development harness verifies hashes/declared edits, rejects path collisions, and excludes source bytes/hashes from shared CAS/task context; official corpus checks pending |
+| source_view/worker_view, view_diff, no side channels | Development harness verifies hashes/declared edits, rejects path collisions, and excludes source bytes/hashes from shared CAS/task context; live source pass verified private-only blobs absent from shared CAS; official corpus checks pending |
 | Oracle PASS/HARMFUL fixtures, INVALID handling | Development oracle plus compiled behavior tests implemented; arbitrary candidate returns INVALID; official oracles still required |
 | Preregistered manifest, randomized paired repetitions | Reproducible paired schedule and verification implemented; official admission/freeze, provider seed support and execution pending |
-| Case-cluster bootstrap, conservative bounds, thresholds | Complete-pair statistics and CLI implemented/tested; official manifest freeze, missing-data handling and terminal assessment pending |
+| Case-cluster bootstrap, conservative bounds, thresholds | Complete-pair statistics and CLI implemented/tested, including DELIVERED/NO_DELIVERY dispositions and the PTSR guardrail; official manifest freeze, missing-data handling and terminal assessment pending |
 | Raw official data and comparative report | No runs; no PASS/FAIL/INCONCLUSIVE claim |
 
 ## Next implementation sequence
 
-1. Complete live provider/schema and sandbox-conformance acceptance. Claude Code
+1. Live provider, schema and Docker confinement acceptance passed on one
+   development mission in all four configurations. Extend live coverage to
+   the development pilot cases (a Rust image for their verifiers is not
+   installed locally, and Myr never pulls one) and to repeated runs. Claude Code
    has passed only a minimal finish smoke. Preserve explicit billing choice; do
    not inspect credentials or treat fixture/mock success as live evidence.
 2. Complete interruption recovery and candidate lifecycle behavior (evidence
    recorded for one candidate blocks graph-level promotion for later candidates
    in the same scope); preserve the separation between invalid user inputs,
    invalid planner outputs and infrastructure failures.
-3. Complete accounting, matched baseline, corpus checks, missing-data statistics, freezing,
-   official runs, and report. Keep development evidence separate from official data.
+3. Pilot the communication cost. Live MW/0 used about 30 times the prose
+   baseline's communication tokens. Reduce MW_RENDER, schema and CAS volume,
+   and the MW/0 call count, without changing the frozen counting rule. Revise
+   the -25% threshold only through the pilot rule of Appendix C.4, before
+   freezing. Also: in MW/0 a reviewer's contradiction of the source CLAIM does
+   not block delivery unless the claim is a binding obligation, while baseline
+   reviewers can reject; confirm this asymmetry is intended.
+4. Complete corpus checks, missing-data statistics, freezing, official runs, and
+   report. Keep development evidence separate from official data.
 
 The full objective remains active; no blocker has been declared.
 The scripted pilot is not a matched live-provider baseline and

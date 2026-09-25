@@ -17,6 +17,8 @@ use std::time::Duration;
 
 pub struct Execution {
     pub review_context: Option<ObjectRef>,
+    /// Planner source pass only: the harness-private source view.
+    pub private_view: Option<crate::source::PrivateView>,
     pub slot: myr_adapter::config::RoleSlot,
     pub session: SessionConfig,
     pub provider: ProviderConfig,
@@ -152,7 +154,13 @@ pub(crate) fn run_with(
     }
     let agent = execution.session.identity.agent.clone();
     let schema = myr_adapter::schema::response_schema(execution.session.role);
-    let baseline = execution.session.baseline.clone();
+    let private_view = execution.private_view.take();
+    // The source pass's repository is its private view; everyone else's is
+    // the sealed baseline. Both are DIRECT_REPO content by provenance.
+    let repository: std::collections::BTreeSet<ObjectRef> = match &private_view {
+        Some(view) => view.files.keys().copied().collect(),
+        None => execution.session.baseline.values().copied().collect(),
+    };
     if let Some(context) = execution.review_context {
         crate::review::validate_task(
             graph,
@@ -166,6 +174,11 @@ pub(crate) fn run_with(
     if let Some(context) = execution.review_context {
         session.bind_review_context(graph, context)?;
     }
+    let mut private_listing = None;
+    if let Some(view) = private_view {
+        session.bind_private_view(view.files)?;
+        private_listing = Some(serde_json::json!({ "repository": view.listing }).to_string());
+    }
     let mut budget = Budget::new(Limits {
         calls: task.call_budget,
         reference_tokens: task.token_budget,
@@ -177,6 +190,7 @@ pub(crate) fn run_with(
         SegmentKind::MwRender,
         myr_wire::render(&Object::Task(task.clone())).map_err(crate::Error::from)?,
     )];
+    history.extend(private_listing.map(|listing| (SegmentKind::DirectRepo, listing)));
     let mut objects = Vec::new();
     let mut cas_segments = Vec::new();
     let result = (|| {
@@ -213,9 +227,14 @@ pub(crate) fn run_with(
                     let _ = budget.settle(permit, None);
                     return failure(graph, task_ref, &objects, code);
                 }
-                Err(crate::dispatch::Error::Transport(_)) => {
+                Err(crate::dispatch::Error::Transport(error)) => {
                     let _ = budget.settle(permit, None);
-                    return failure(graph, task_ref, &objects, FailCode::ProviderUnavailable);
+                    let code = if error.is_agent_output_failure() {
+                        FailCode::InvalidAgentOutput
+                    } else {
+                        FailCode::ProviderUnavailable
+                    };
+                    return failure(graph, task_ref, &objects, code);
                 }
                 Err(e) => return Err(e.into()),
             };
@@ -237,6 +256,14 @@ pub(crate) fn run_with(
                 } => {
                     // Retain committed outputs before any subsequent fallible audit.
                     objects.extend(emitted.iter().copied());
+                    if matches!(
+                        response.as_ref().map(|r| &r.action),
+                        Some(Action::PutArtifact { .. })
+                    ) {
+                        for reference in &emitted {
+                            dispatcher.record_artifact_origin(&agent, *reference);
+                        }
+                    }
                     if let Some(bytes) = fetched_raw_bytes {
                         dispatcher.record_cas_read(bytes)?;
                     }
@@ -252,13 +279,13 @@ pub(crate) fn run_with(
                         Some(Action::Fetch { reference }) if reference == task.instruction => {
                             SegmentKind::Goal
                         }
-                        Some(Action::Fetch { reference })
-                            if baseline.values().any(|r| *r == reference) =>
-                        {
-                            SegmentKind::DirectRepo
-                        }
                         Some(Action::Fetch { reference }) if reference.kind == Kind::Artifact => {
-                            SegmentKind::CasReferenced
+                            dispatcher.classify_artifact(
+                                &agent,
+                                reference,
+                                &repository,
+                                SegmentKind::CasReferenced,
+                            )
                         }
                         Some(Action::Fetch { .. }) => SegmentKind::MwRender,
                         _ => SegmentKind::LocalTool,
@@ -411,6 +438,7 @@ mod tests {
         };
         let execution = Execution {
             review_context: None,
+            private_view: None,
             slot: myr_adapter::config::RoleSlot::Worker,
             session: SessionConfig {
                 task,
@@ -496,6 +524,7 @@ mod tests {
             let provider = sealed.policy().providers.get(slot).clone();
             let make_execution = |context| Execution {
                 review_context: Some(context),
+                private_view: None,
                 slot,
                 provider: provider.clone(),
                 session: SessionConfig {

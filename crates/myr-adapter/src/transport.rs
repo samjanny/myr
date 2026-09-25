@@ -38,14 +38,21 @@ pub enum Error {
     Cli(#[from] crate::process::Error),
     #[error("Claude Code must be signed in with a Claude.ai subscription")]
     CliAuth,
-    #[error("Codex CLI must be signed in using ChatGPT")]
+    #[error("Codex CLI must be signed in using ChatGPT with an unexpired session")]
     CodexAuth,
-    #[error("provider CLI attempted an unexpected native tool")]
-    UnexpectedTool,
+    #[error("provider CLI attempted an unexpected native tool ({0})")]
+    UnexpectedTool(String),
     #[error("installed CLI lacks required isolation or structured-output flags")]
     CliVersion,
-    #[error("provider CLI failed; no alternate billing backend was attempted")]
-    CliExit,
+    #[error("provider CLI failed ({0}); no alternate billing backend was attempted")]
+    CliExit(String),
+    /// The provider itself exhausted its structured-output attempts: an agent
+    /// output failure, not provider unavailability.
+    #[error("provider exhausted its structured-output attempts")]
+    StructuredOutput,
+    /// Closed diagnostic for an unparseable CLI event stream.
+    #[error("provider CLI returned an unexpected event stream ({0})")]
+    CliEvents(String),
     #[error("provider temporary file I/O failed")]
     Io,
     #[error("invalid provider configuration: {0}")]
@@ -64,6 +71,23 @@ pub enum Error {
     TooLarge,
     #[error("provider returned an incomplete, refused, or malformed structured response")]
     Response,
+}
+
+impl Error {
+    /// True when the model, not the provider or infrastructure, failed to
+    /// produce valid structured output. Runners record INVALID_AGENT_OUTPUT.
+    pub fn is_agent_output_failure(&self) -> bool {
+        matches!(self, Self::StructuredOutput)
+    }
+}
+
+/// Closed, sanitized diagnostic token for private attempt records.
+pub(crate) fn diagnostic_token(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .take(64)
+        .collect()
 }
 
 pub(crate) fn validate_request(request: &Request) -> Result<(), Error> {

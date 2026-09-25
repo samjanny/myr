@@ -95,6 +95,12 @@ fn command(executable: &Path, dir: &Path, model: &str, output_tokens: u32) -> Co
         "features.rollout_budget.enabled=true",
         "features.rollout_budget.prefill_token_weight=0",
         "features.rollout_budget.sampling_token_weight=1",
+        // Required by Codex CLI 0.157; an empty list injects no reminder text,
+        // so model-visible context stays exactly what Myr accounted for.
+        "features.rollout_budget.reminder_at_remaining_tokens=[]",
+        // The rollout budget is an under-development feature; its advisory is
+        // otherwise emitted as an `error` item that the strict parser rejects.
+        "suppress_unstable_features_warning=true",
     ] {
         cmd.args(["-c", setting]);
     }
@@ -128,16 +134,38 @@ pub fn complete(config: &ProviderConfig, request: &Request) -> Result<Completion
         remaining(start, request.timeout)?,
     )?;
     if !output.success {
-        return Err(Error::CliExit);
+        return Err(if session_rejected(&output.stdout) {
+            Error::CodexAuth
+        } else if String::from_utf8_lossy(&output.stdout).contains("\"turn.failed\"") {
+            Error::CliExit("turn_failed".into())
+        } else {
+            Error::CliExit("exit".into())
+        });
     }
     parse_completion(&output.stdout)
 }
+
+/// `codex login status` can report a login whose refresh token has expired;
+/// the failed turn then reports an unauthorized response. Never retried.
+fn session_rejected(stdout: &[u8]) -> bool {
+    String::from_utf8_lossy(stdout).lines().any(|line| {
+        serde_json::from_str::<Value>(line).is_ok_and(|event| {
+            event["type"] == "turn.failed"
+                && event["error"]["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("unauthorized (401)"))
+        })
+    })
+}
 pub fn parse_completion(bytes: &[u8]) -> Result<Completion, Error> {
     let text = std::str::from_utf8(bytes).map_err(|_| Error::Response)?;
-    let mut message = None;
+    // `--output-schema` constrains only the final response. Earlier messages in
+    // the same turn are commentary: never applied, only the final one is.
+    let mut messages: Vec<(Option<String>, Vec<u8>)> = Vec::new();
     let mut usage = None;
     for line in text.lines().filter(|s| !s.trim().is_empty()) {
-        let event: Value = serde_json::from_str(line).map_err(|_| Error::Response)?;
+        let event: Value =
+            serde_json::from_str(line).map_err(|_| Error::CliEvents("non_json_line".into()))?;
         match event["type"].as_str() {
             Some("thread.started" | "turn.started") => {}
             Some("item.started" | "item.updated" | "item.completed") => {
@@ -145,24 +173,24 @@ pub fn parse_completion(bytes: &[u8]) -> Result<Completion, Error> {
                     event["item"]["type"].as_str(),
                     Some("reasoning" | "agent_message")
                 ) {
-                    return Err(Error::UnexpectedTool);
+                    return Err(Error::UnexpectedTool(crate::transport::diagnostic_token(
+                        event["item"]["type"].as_str().unwrap_or("unknown"),
+                    )));
                 }
                 if event["type"] == "item.completed" && event["item"]["type"] == "agent_message" {
-                    if message.is_some() {
-                        return Err(Error::Response);
-                    }
-                    message = Some(
+                    messages.push((
+                        event["item"]["phase"].as_str().map(str::to_owned),
                         event["item"]["text"]
                             .as_str()
                             .ok_or(Error::Response)?
                             .as_bytes()
                             .to_vec(),
-                    );
+                    ));
                 }
             }
             Some("turn.completed") => {
                 if usage.is_some() {
-                    return Err(Error::Response);
+                    return Err(Error::CliEvents("multiple_turns".into()));
                 }
                 usage = Some(Usage {
                     input_tokens: event["usage"]["input_tokens"].as_u64(),
@@ -170,16 +198,34 @@ pub fn parse_completion(bytes: &[u8]) -> Result<Completion, Error> {
                     cached_input_tokens: event["usage"]["cached_input_tokens"].as_u64(),
                 });
             }
-            _ => return Err(Error::Response),
+            other => {
+                return Err(Error::CliEvents(format!(
+                    "event_{}",
+                    crate::transport::diagnostic_token(other.unwrap_or("untyped"))
+                )));
+            }
         }
     }
-    let raw_output = message.ok_or(Error::Response)?;
+    let finals: Vec<_> = messages
+        .iter()
+        .filter(|(phase, _)| phase.as_deref() == Some("final_answer"))
+        .collect();
+    let raw_output = match finals.as_slice() {
+        [(_, text)] => text.clone(),
+        [] => messages
+            .iter()
+            .rev()
+            .find(|(phase, _)| phase.as_deref() != Some("commentary"))
+            .map(|(_, text)| text.clone())
+            .ok_or_else(|| Error::CliEvents("missing_message".into()))?,
+        _ => return Err(Error::CliEvents("multiple_final_messages".into())),
+    };
     if raw_output.len() > crate::MAX_RESPONSE_BYTES {
         return Err(Error::TooLarge);
     }
     Ok(Completion {
         raw_output,
-        usage: usage.ok_or(Error::Response)?,
+        usage: usage.ok_or_else(|| Error::CliEvents("missing_usage".into()))?,
         observed_model: None,
     })
 }
@@ -187,6 +233,68 @@ pub fn parse_completion(bytes: &[u8]) -> Result<Completion, Error> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn only_the_final_message_of_a_turn_is_the_response() {
+        let message = |text: &str, phase: Option<&str>| {
+            let mut item = json!({"type":"agent_message","text":text});
+            if let Some(phase) = phase {
+                item["phase"] = phase.into();
+            }
+            json!({"type":"item.completed","item":item}).to_string()
+        };
+        let turn = |messages: Vec<String>| {
+            let mut lines = vec![json!({"type":"turn.started"}).to_string()];
+            lines.extend(messages);
+            lines.push(
+                json!({"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}})
+                    .to_string(),
+            );
+            lines.join("\n")
+        };
+        let finish = r#"{"action":{"tool":"finish","arguments":{}}}"#;
+        // Unmarked commentary precedes the final structured answer.
+        let body = turn(vec![
+            message("Checking the claim.", None),
+            message(finish, None),
+        ]);
+        assert_eq!(
+            parse_completion(body.as_bytes()).unwrap().raw_output,
+            finish.as_bytes()
+        );
+        // An explicit final answer wins even when commentary follows it.
+        let body = turn(vec![
+            message(finish, Some("final_answer")),
+            message("{\"action\":{}}", Some("commentary")),
+        ]);
+        assert_eq!(
+            parse_completion(body.as_bytes()).unwrap().raw_output,
+            finish.as_bytes()
+        );
+        // Two explicit final answers are ambiguous; commentary alone is none.
+        let body = turn(vec![
+            message(finish, Some("final_answer")),
+            message(finish, Some("final_answer")),
+        ]);
+        assert!(matches!(
+            parse_completion(body.as_bytes()),
+            Err(Error::CliEvents(_))
+        ));
+        let body = turn(vec![message("thinking", Some("commentary"))]);
+        assert!(matches!(
+            parse_completion(body.as_bytes()),
+            Err(Error::CliEvents(_))
+        ));
+    }
+    #[test]
+    fn expired_session_is_an_authentication_failure() {
+        assert!(session_rejected(
+            br#"{"type":"error","message":"Reconnecting... 1/5"}
+{"type":"turn.failed","error":{"message":"workspace routing discovery unauthorized (401)"}}"#
+        ));
+        assert!(!session_rejected(
+            br#"{"type":"turn.failed","error":{"message":"model overloaded"}}"#
+        ));
+    }
     #[test]
     fn auth_probe_rejects_api_credentials_and_unknown_status() {
         assert!(subscription_status("Logged in using ChatGPT\n"));
@@ -217,7 +325,7 @@ mod tests {
         let tool=json!({"type":"item.completed","item":{"type":"command_execution","command":"not executed by this test"}}).to_string();
         assert!(matches!(
             parse_completion(tool.as_bytes()),
-            Err(Error::UnexpectedTool)
+            Err(Error::UnexpectedTool(_))
         ));
     }
     #[test]
@@ -232,6 +340,8 @@ mod tests {
         assert!(args.contains("--ignore-user-config"));
         assert!(args.contains("default_permissions=\"myr\""));
         assert!(args.contains("permissions.myr.network.enabled=false"));
+        assert!(args.contains("features.rollout_budget.reminder_at_remaining_tokens=[]"));
+        assert!(args.contains("suppress_unstable_features_warning=true"));
         assert!(!args.contains("dangerously") && !args.contains("danger-full-access"));
     }
 }

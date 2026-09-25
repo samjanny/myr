@@ -25,6 +25,13 @@ pub struct Config {
     pub max_reference_output_tokens: u64,
     pub quarantine: PathBuf,
     pub docker: DockerRuntime,
+    /// Primary benchmark condition: planner source pass after the seal.
+    pub source: Option<SourcePass>,
+}
+
+pub struct SourcePass {
+    pub instruction: ObjectRef,
+    pub view: crate::source::PrivateView,
 }
 
 #[derive(Debug, Serialize)]
@@ -50,7 +57,11 @@ pub struct Report {
     pub active_assumptions: Vec<ObjectRef>,
     pub provenance: Vec<ObjectRef>,
     pub budget: budget::Ledger,
+    /// Appendix C reference totals for the whole mission, planning included.
+    pub accounting: accounting::Totals,
     pub private_dispatch_checkpoint: Option<ObjectRef>,
+    /// With a source view: whether shared CAS stayed free of private-only blobs.
+    pub source_blobs_absent: Option<bool>,
 }
 
 pub struct Outcome {
@@ -92,6 +103,7 @@ pub struct PlanningFailureReport {
     #[serde(flatten)]
     pub contents: ResultContents,
     pub budget: budget::Ledger,
+    pub accounting: accounting::Totals,
     pub private_dispatch_checkpoint: Option<ObjectRef>,
 }
 
@@ -174,6 +186,7 @@ pub fn plan_and_run(
                 created,
                 contents: collect_contents(graph, roots)?,
                 budget: dispatcher.budget().clone(),
+                accounting: dispatcher.accounting().totals().clone(),
                 private_dispatch_checkpoint: dispatcher.last_checkpoint(),
             };
             let private_record = audit
@@ -259,6 +272,7 @@ fn execution(
     let provider = sealed.policy().providers.get(slot).clone();
     task::Execution {
         review_context: context,
+        private_view: None,
         slot,
         provider: provider.clone(),
         session: SessionConfig {
@@ -428,8 +442,20 @@ fn run_existing_with(
         active_assumptions: vec![],
         provenance: vec![],
         budget: dispatcher.budget().clone(),
+        accounting: Default::default(),
         private_dispatch_checkpoint: None,
+        source_blobs_absent: None,
     };
+    let baseline_files: BTreeSet<ObjectRef> =
+        serde_json::from_slice::<std::collections::BTreeMap<String, ObjectRef>>(
+            &graph
+                .cas()
+                .get(sealed.policy().baseline)
+                .map_err(crate::Error::from)?,
+        )
+        .map_err(crate::Error::from)?
+        .into_values()
+        .collect();
     let obligations: Vec<_> = sealed
         .ir()
         .criteria
@@ -440,13 +466,83 @@ fn run_existing_with(
     // The worker produces the artifacts every sealed interpretive choice affects,
     // so all pending assumptions materialize here, not earlier and not silently.
     let decisions: Vec<_> = sealed.ir().assumptions.iter().map(|a| a.atom).collect();
+    // Source pass: the planner, whose goal and task structure are now sealed,
+    // reads the private source view. It has no write capability; its CLAIMs,
+    // ATTESTs, assumptions and artifacts are the only channel to later stages.
+    let mut forwarded = Vec::new();
+    if let Some(source) = &config.source {
+        let task = goal::issue_task(
+            graph,
+            goal_ref,
+            goal::TaskDraft {
+                inputs: sealed.ir().registry.clone(),
+                capabilities: vec![],
+                obligations: vec![],
+                decisions: vec![],
+                instruction: source.instruction,
+            },
+        )?;
+        let mut execution = execution(&sealed, config, RoleSlot::Planner, task, None);
+        execution.private_view = Some(source.view.clone());
+        let result = driver.task(graph, dispatcher, execution);
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                fail_stage(graph, &mut report, RoleSlot::Planner, task, &error)?;
+                return finish(
+                    graph,
+                    audit,
+                    dispatcher,
+                    report,
+                    deadline,
+                    config,
+                    &baseline_files,
+                );
+            }
+        };
+        let stop = !result.finished || result.failure.is_some();
+        report.failures.extend(result.failure);
+        forwarded = result
+            .objects
+            .iter()
+            .copied()
+            .filter(|r| {
+                matches!(
+                    r.kind,
+                    Kind::Claim | Kind::Attest | Kind::Assumption | Kind::Artifact
+                )
+            })
+            .collect();
+        report.stages.push(Stage {
+            slot: RoleSlot::Planner,
+            task,
+            result,
+        });
+        if stop {
+            return finish(
+                graph,
+                audit,
+                dispatcher,
+                report,
+                deadline,
+                config,
+                &baseline_files,
+            );
+        }
+    }
     let worker = goal::issue_task(
         graph,
         goal_ref,
         goal::TaskDraft {
             // The sealed registry is the only predicate vocabulary the worker
             // may use in claims; the rest of its closure comes from the scope.
-            inputs: sealed.ir().registry.clone(),
+            inputs: sealed
+                .ir()
+                .registry
+                .iter()
+                .copied()
+                .chain(forwarded.iter().copied())
+                .collect(),
             capabilities: config
                 .writable
                 .iter()
@@ -466,7 +562,15 @@ fn run_existing_with(
         Ok(result) => result,
         Err(error) => {
             fail_stage(graph, &mut report, RoleSlot::Worker, worker, &error)?;
-            return finish(graph, audit, dispatcher, report, deadline);
+            return finish(
+                graph,
+                audit,
+                dispatcher,
+                report,
+                deadline,
+                config,
+                &baseline_files,
+            );
         }
     };
     let finished = work.finished;
@@ -485,7 +589,15 @@ fn run_existing_with(
         result: work,
     });
     if !finished || !report.failures.is_empty() {
-        return finish(graph, audit, dispatcher, report, deadline);
+        return finish(
+            graph,
+            audit,
+            dispatcher,
+            report,
+            deadline,
+            config,
+            &baseline_files,
+        );
     }
     let candidate = match candidate::prepare_recorded(graph, goal_ref, &deltas, &config.writable) {
         Ok(candidate) => candidate,
@@ -496,7 +608,15 @@ fn run_existing_with(
                 FailCode::InvalidAgentOutput,
                 &error.to_string(),
             )?;
-            return finish(graph, audit, dispatcher, report, deadline);
+            return finish(
+                graph,
+                audit,
+                dispatcher,
+                report,
+                deadline,
+                config,
+                &baseline_files,
+            );
         }
     };
     report.candidate = Some(candidate.reference());
@@ -509,7 +629,15 @@ fn run_existing_with(
                 FailCode::TimeBudget,
                 "Mission deadline reached",
             )?;
-            return finish(graph, audit, dispatcher, report, deadline);
+            return finish(
+                graph,
+                audit,
+                dispatcher,
+                report,
+                deadline,
+                config,
+                &baseline_files,
+            );
         }
         let Object::Atom(atom) = graph.get(criterion.atom).map_err(crate::Error::from)? else {
             unreachable!()
@@ -573,7 +701,15 @@ fn run_existing_with(
         );
         report.acceptance = Some(proof.acceptance);
         report.state = MissionState::Unsat;
-        return finish(graph, audit, dispatcher, report, deadline);
+        return finish(
+            graph,
+            audit,
+            dispatcher,
+            report,
+            deadline,
+            config,
+            &baseline_files,
+        );
     }
     for slot in [RoleSlot::ReviewerA, RoleSlot::ReviewerB] {
         if remaining().is_zero() {
@@ -593,6 +729,7 @@ fn run_existing_with(
         )?;
         let inputs = std::iter::once(context)
             .chain(claims.iter().copied())
+            .chain(forwarded.iter().copied())
             .collect();
         let task = goal::issue_task(
             graph,
@@ -657,7 +794,15 @@ fn run_existing_with(
             &error.to_string(),
         )?,
     }
-    finish(graph, audit, dispatcher, report, deadline)
+    finish(
+        graph,
+        audit,
+        dispatcher,
+        report,
+        deadline,
+        config,
+        &baseline_files,
+    )
 }
 
 /// Machine-readable proof recorded as the CONFLICTING_OBLIGATIONS diagnostic.
@@ -724,7 +869,12 @@ fn finish(
     dispatcher: &Dispatcher,
     mut report: Report,
     deadline: Instant,
+    config: &Config,
+    baseline_files: &BTreeSet<ObjectRef>,
 ) -> Result<Outcome, Error> {
+    if let Some(source) = &config.source {
+        report.source_blobs_absent = Some(source.view.absent_from_shared(graph, baseline_files)?);
+    }
     let mut roots = report.failures.clone();
     roots.push(report.goal);
     if let Some(candidate) = report.candidate {
@@ -745,8 +895,9 @@ fn finish(
     report.deadline_exceeded = Instant::now() >= deadline;
     if !report.deadline_exceeded
         && report.failures.is_empty()
-        && report.stages.len() == 3
+        && report.stages.len() == 3 + usize::from(config.source.is_some())
         && report.stages.iter().all(|s| s.result.finished)
+        && report.source_blobs_absent != Some(false)
         && report
             .acceptance
             .as_ref()
@@ -759,6 +910,7 @@ fn finish(
         };
     }
     report.budget = dispatcher.budget().clone();
+    report.accounting = dispatcher.accounting().totals().clone();
     report.private_dispatch_checkpoint = dispatcher.last_checkpoint();
     let private_record = audit
         .put_artifact(&serde_json::to_vec(&report).map_err(crate::Error::from)?)
@@ -810,6 +962,7 @@ mod tests {
         policy: ObjectRef,
         commands: usize,
     }
+    const PRIVATE: &[u8] = b"baseline // thread-safe";
     impl Driver for Simulated {
         fn task(
             &mut self,
@@ -828,6 +981,50 @@ mod tests {
             let Object::Task(task) = graph.get(execution.session.task).unwrap() else {
                 unreachable!()
             };
+            if slot == RoleSlot::Planner {
+                // Source pass: read the private file, try to read worker_view and
+                // republish the private file verbatim (both rejected), quote
+                // the relevant text, finish.
+                let private = ObjectRef::new(Kind::Artifact, myr_wire::artifact_cid(PRIVATE));
+                let mut calls = 0;
+                let shared = ObjectRef::new(Kind::Artifact, myr_wire::artifact_cid(b"baseline"));
+                return task::run_with(graph, dispatcher, execution, |_, request| {
+                    match calls {
+                        1 => assert!(request.prompt.contains(&base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            PRIVATE
+                        ))),
+                        2 => assert!(request.prompt.contains("only its private view")),
+                        3 => assert!(request.prompt.contains("duplicates a private source file")),
+                        _ => {}
+                    }
+                    let action = match calls {
+                        0 => Action::Fetch { reference: private },
+                        // The worker_view file is outside the source pass's view.
+                        1 => Action::Fetch { reference: shared },
+                        2 => Action::PutArtifact {
+                            content_base64: base64::Engine::encode(
+                                &base64::engine::general_purpose::STANDARD,
+                                PRIVATE,
+                            ),
+                        },
+                        3 => Action::PutArtifact {
+                            content_base64: "dGhyZWFkLXNhZmU=".into(),
+                        },
+                        _ => Action::Finish {},
+                    };
+                    calls += 1;
+                    Ok(Completion {
+                        raw_output: serde_json::to_vec(&Response { action }).unwrap(),
+                        usage: Usage::default(),
+                        observed_model: Some("fixture".into()),
+                    })
+                });
+            }
+            if self.mode == "source" && slot == RoleSlot::Worker {
+                let quote = ObjectRef::new(Kind::Artifact, myr_wire::artifact_cid(b"thread-safe"));
+                assert!(task.inputs.contains(&quote));
+            }
             let claims: Vec<_> = task
                 .inputs
                 .iter()
@@ -947,7 +1144,47 @@ mod tests {
             docker: DockerRuntime {
                 executable: f._dir.path().join("never-spawned"),
             },
+            source: None,
         }
+    }
+
+    #[test]
+    fn source_pass_forwards_only_protocol_outputs_and_keeps_private_blobs_out_of_cas() {
+        let mut f = Fixture::new(true);
+        let mut config = config(&mut f);
+        let instruction = f
+            .graph
+            .register_artifact(crate::source::INSTRUCTION.as_bytes())
+            .unwrap();
+        config.source = Some(SourcePass {
+            instruction,
+            view: crate::source::SourceView::new(crate::views::Tree::from([(
+                "f".into(),
+                PRIVATE.to_vec(),
+            )]))
+            .unwrap()
+            .private_view(),
+        });
+        let mut driver = Simulated {
+            mode: "source",
+            policy: f.policy,
+            commands: 0,
+        };
+        let result = run_with(&mut f.graph, &f.audit, f.goal, &config, &mut driver).unwrap();
+        let report = result.report;
+        assert_eq!(report.stages.len(), 4);
+        assert_eq!(report.stages[0].slot, RoleSlot::Planner);
+        assert_eq!(report.source_blobs_absent, Some(true));
+        assert_eq!(report.state, MissionState::Complete);
+        let private = ObjectRef::new(Kind::Artifact, myr_wire::artifact_cid(PRIVATE));
+        assert!(!f.graph.cas().exists(private).unwrap());
+        // The source TASK had no write capability and no obligations.
+        let Object::Task(source) = f.graph.get(report.stages[0].task).unwrap() else {
+            unreachable!()
+        };
+        assert!(source.capabilities.is_empty() && source.obligations.is_empty());
+        // Private reads are not shared CAS retrieval traffic.
+        assert_eq!(report.accounting.cas_raw_bytes, 0);
     }
 
     #[test]

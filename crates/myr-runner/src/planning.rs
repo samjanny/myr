@@ -132,6 +132,7 @@ pub(crate) fn run_with(
             crate::Error::from(invalid("planner baseline manifest is not canonical")).into(),
         );
     }
+    let repository: std::collections::BTreeSet<ObjectRef> = baseline.values().copied().collect();
     let mut history = vec![
         (
             SegmentKind::Goal,
@@ -189,14 +190,23 @@ pub(crate) fn run_with(
                     "Mission budget exhausted during planning",
                 );
             }
-            Err(crate::dispatch::Error::Transport(_)) => {
+            Err(crate::dispatch::Error::Transport(error)) => {
                 let _ = budget.settle(permit, None);
-                return failure(
-                    graph,
-                    created,
-                    FailCode::ProviderUnavailable,
-                    "Planner provider failed; no billing fallback attempted",
-                );
+                return if error.is_agent_output_failure() {
+                    failure(
+                        graph,
+                        created,
+                        FailCode::InvalidAgentOutput,
+                        "Planner provider exhausted its structured-output attempts",
+                    )
+                } else {
+                    failure(
+                        graph,
+                        created,
+                        FailCode::ProviderUnavailable,
+                        "Planner provider failed; no billing fallback attempted",
+                    )
+                };
             }
             Err(error) => return Err(error.into()),
         };
@@ -231,6 +241,7 @@ pub(crate) fn run_with(
         }
         match catalog.handle_response(graph, mission, policy, &completion.raw_output) {
             Ok(Step::Created(reference)) => {
+                dispatcher.record_artifact_origin("planner", reference);
                 created.push(reference);
                 history.push((
                     SegmentKind::LocalTool,
@@ -240,7 +251,7 @@ pub(crate) fn run_with(
             Ok(Step::Fetched { reference, bytes }) => {
                 dispatcher.record_cas_read(bytes.len() as u64)?;
                 let (kind, value) = if reference.kind == Kind::Artifact {
-                    (if baseline.values().any(|r| *r == reference) { SegmentKind::DirectRepo } else { SegmentKind::CasReferenced }, serde_json::json!({"reference":reference,"content_base64":STANDARD.encode(bytes)}).to_string())
+                    (dispatcher.classify_artifact("planner", reference, &repository, SegmentKind::CasReferenced), serde_json::json!({"reference":reference,"content_base64":STANDARD.encode(bytes)}).to_string())
                 } else {
                     (
                         SegmentKind::MwRender,

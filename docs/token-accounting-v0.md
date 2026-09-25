@@ -1,6 +1,6 @@
 ## Appendix C — token-accounting-v0
 
-Inter-agent communication is counted with one reference tokenizer, `cl100k_base`, applied identically to both pipelines and all providers. *Written by ChatGPT.*
+Inter-agent communication is counted with one reference tokenizer, `cl100k_base`, applied identically to both pipelines and all providers.
 
 The library version, tokenizer assets, and their hashes are recorded in the frozen manifest. Native provider counts are cost telemetry only.
 
@@ -12,13 +12,16 @@ The runtime classifies every segment inserted into an LLM's context before calli
 | --- | --- | --- | --- |
 | `SYSTEM` | Shared system prompt | No | No |
 | `GOAL` | Initial mission | No | No |
-| `DIRECT_REPO` | Files read directly by the agent itself | No | No |
-| `LOCAL_TOOL` | The agent's own tool output | No | No |
+| `DIRECT_REPO` | Initial repository content read by the agent itself (for the source pass, its private view) | No | No |
+| `LOCAL_TOOL` | The agent's own tool output, including artifacts it authored | No | No |
 | `INTER_AGENT_PROSE` | Other agents' messages, including file excerpts, tool output, instructions, or conclusions copied into them | Yes | — |
+| `INTER_AGENT_ARTIFACT` | Artifact content authored by another agent of the mission, including candidate files and listings derived from them | Yes | Yes |
 | `MW_RENDER` | TASK, CLAIM, FACT, EVIDENCE, ASSUMPTION representation inserted into context | — | Yes |
-| `CAS_REFERENCED` | Artifact content retrieved because an inter-agent object references it and inserted into context | — | Yes |
+| `CAS_REFERENCED` | Other artifact content retrieved because an inter-agent object references it (runtime and protocol records) and inserted into context | — | Yes |
 | `VALIDATION_FEEDBACK` | Validator messages correcting invalid output | — | Yes |
 | `PROTOCOL_SCHEMA` | Schemas and tool definitions required only by MW/0 | — | Yes |
+
+Artifact content is classified by provenance, not by retrieval channel. The same bytes cost the same in both pipelines: a baseline reviewer that reads a file the worker wrote counts it as `INTER_AGENT_ARTIFACT` even though it reads the repository, just as a Myr reviewer fetching it through CAS does. Bytes identical to an initial repository file are `DIRECT_REPO` however they are retrieved. The first agent that authored an artifact in a mission is its author.
 
 Each baseline agent receives only inter-agent messages addressed to it, without automatic summaries.
 
@@ -32,8 +35,10 @@ Each counted segment records `utf8_bytes` and `reference_tokens = len(cl100k_bas
 
 ```text
 baseline_comm_tokens = Σ tokens(INTER_AGENT_PROSE)
+                     + Σ tokens(INTER_AGENT_ARTIFACT)
 
-myr_comm_tokens      = Σ tokens(MW_RENDER)
+myr_comm_tokens      = Σ tokens(INTER_AGENT_ARTIFACT)
+                     + Σ tokens(MW_RENDER)
                      + Σ tokens(CAS_REFERENCED)
                      + Σ tokens(VALIDATION_FEEDBACK)
                      + Σ tokens(PROTOCOL_SCHEMA)

@@ -140,13 +140,35 @@ pub fn complete(config: &ProviderConfig, request: &Request) -> Result<Completion
         remaining(start, request.timeout)?,
     )?;
     if !output.success {
-        return Err(Error::CliExit);
+        return Err(failure(&output.stdout));
     }
     parse_completion(&output.stdout)
 }
 
+/// Classify a nonzero exit from its JSON result, using only closed fields.
+fn failure(stdout: &[u8]) -> Error {
+    let Ok(result) = serde_json::from_slice::<Value>(stdout) else {
+        return Error::CliExit("no structured result".into());
+    };
+    if result["subtype"] == "error_max_structured_output_retries" {
+        return Error::StructuredOutput;
+    }
+    let subtype = result["subtype"].as_str().unwrap_or("unknown");
+    let status = result["api_error_status"]
+        .as_u64()
+        .map(|s| format!(" status={s}"))
+        .unwrap_or_default();
+    Error::CliExit(format!(
+        "subtype={}{status}",
+        crate::transport::diagnostic_token(subtype)
+    ))
+}
+
 pub fn parse_completion(bytes: &[u8]) -> Result<Completion, Error> {
     let result: Value = serde_json::from_slice(bytes).map_err(|_| Error::Response)?;
+    if result["subtype"] == "error_max_structured_output_retries" {
+        return Err(Error::StructuredOutput);
+    }
     if result["type"] != "result"
         || result["subtype"] != "success"
         || result["is_error"] != false
@@ -178,6 +200,24 @@ pub fn parse_completion(bytes: &[u8]) -> Result<Completion, Error> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn structured_output_exhaustion_is_an_agent_failure_not_unavailability() {
+        let exhausted = json!({"type":"result","subtype":"error_max_structured_output_retries","is_error":true});
+        let bytes = serde_json::to_vec(&exhausted).unwrap();
+        assert!(matches!(failure(&bytes), Error::StructuredOutput));
+        assert!(matches!(
+            parse_completion(&bytes),
+            Err(Error::StructuredOutput)
+        ));
+        assert!(Error::StructuredOutput.is_agent_output_failure());
+        let overloaded = json!({"type":"result","subtype":"error_during_execution","api_error_status":529,"result":"free text is not retained"});
+        let Error::CliExit(reason) = failure(&serde_json::to_vec(&overloaded).unwrap()) else {
+            panic!("expected CLI exit")
+        };
+        assert_eq!(reason, "subtype=error_during_execution status=529");
+        assert!(!Error::CliExit(reason).is_agent_output_failure());
+        assert!(matches!(failure(b"not json"), Error::CliExit(_)));
+    }
     #[test]
     fn only_subscription_auth_is_accepted_and_account_details_are_not_returned() {
         let valid = json!({"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max","email":"private@example.invalid"});

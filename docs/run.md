@@ -90,8 +90,25 @@ Preparation registers core predicates, optional operator-supplied `mission.*`
 predicates with provenance artifacts, command ATOMs, snapshot files and fixed
 English worker/reviewer instructions. Custom runtime configuration itself is
 retained as an immutable artifact. The planner gets an explicit catalog and can
-construct further typed ATOMs. The matched prose baseline is not implemented;
-schema accounting currently compares against an empty shared declaration set.
+construct further typed ATOMs. MW/0 schema accounting compares against the frozen
+[prose baseline](prose-baseline.md) declarations. `--pipeline prose` runs that
+baseline on the same preparation, providers, budgets and command verifiers;
+its result is COMPLETE and delivered only with passing verifiers and two approvals.
+
+Benchmark options, valid for both pipelines:
+
+- `--source-view <dir>`: primary condition. The planner reads this private view
+  only in a source pass after its plan is frozen; see
+  [prose baseline](prose-baseline.md) and [sealed pipeline](sealed-pipeline.md).
+- `--subscription-only`: rejects any `openai-api` or `anthropic-api` backend
+  before a store is created. Only Claude Code and Codex CLI subscription
+  sessions can run. An exhausted or unavailable subscription ends the run as
+  provider unavailability, never with a paid fallback. Extra-usage purchasing
+  configured in the provider account is outside Myr's control and must be
+  disabled there.
+
+Each executed result includes `run_disposition` (DELIVERED, NO_DELIVERY or
+UNAVAILABLE with a reason); see [benchmark collection](benchmark-collection.md).
 
 Tests exercise preparation, opaque file preservation, failure before directory
 creation for missing verifiers, refusal to overwrite stores and an offline failure
