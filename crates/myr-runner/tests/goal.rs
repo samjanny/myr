@@ -109,8 +109,10 @@ fn planner_can_construct_registered_atoms_and_pending_assumption_rationale() {
     };
     assert_eq!(sealed.ir().assumptions[0].rationale, rationale);
     assert_eq!(sealed.ir().criteria[0].atom, command);
+    // Catalog membership (including the new rationale) is enforced at runtime;
+    // the schema does not enumerate catalog CIDs (cost pilot, step B).
     assert!(
-        catalog
+        !catalog
             .response_schema(&mission)
             .to_string()
             .contains(&rationale.cid.to_string())

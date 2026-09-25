@@ -7,17 +7,19 @@ listing. The runtime must select worker-visible inputs and exclude source-view
 benchmark data. Existing references are revalidated when a proposal is compiled.
 
 The response schema uses the same action envelope as the existing transports,
-with `submit_goal`, `define_atom`, `put_rationale` and `fetch` actions. Goal submission
-arguments are Goal IR. It fixes the
-user's goal text and limits references to catalog CIDs. Reference sets of up to
-`MAX_ENUMERATED_REFERENCES` (16) members are enumerated in the schema; larger
-sets, typically the artifact list of a real repository, use the CID pattern so
-the schema stays bounded for the command-line transports. The catalog checks
-every action regardless of what the schema enumerates. Nested objects require
+with `submit_goal`, `define_atom`, `put_rationale`, `fetch` and `fetch_many`
+actions. Goal submission arguments are Goal IR. The schema fixes the user's goal
+text and constrains each reference's kind and CID syntax. It no longer
+enumerates catalog CIDs (cost pilot, step B). Those listings made up about two
+thirds of the schema and were re-sent on every call; the rendered catalog
+already lists the available references. The schema's size is independent of the
+catalog's. The catalog checks every action; an out-of-catalog reference is an
+immediate CAPABILITY_DENIED. Nested objects require
 their declared fields and reject extras. Measurement is explicitly null or a
 procedure/tolerance record; assumptions identify their chosen value, alternatives,
 rationale and affected artifacts. Schema partitioning/accounting is tested, but
-this schema has not yet received live provider compatibility acceptance.
+live missions accepted the earlier enumerated form with Claude Code on
+2026-09-25; the compact form still needs a live run.
 
 `compile_response` limits untrusted output to 1 MiB, uses strict typed decoding,
 rejects duplicate/unknown fields and omitted contract fields, and enforces the

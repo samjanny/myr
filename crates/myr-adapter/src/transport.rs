@@ -309,7 +309,7 @@ mod tests {
         }
     }
     fn response(anthropic: bool) -> Value {
-        let action = json!({"action":{"tool":"finish","arguments":{}}});
+        let action = json!({"actions":[{"tool":"finish","arguments":{}}]});
         if anthropic {
             json!({"type":"message","role":"assistant","model":"pinned-model","stop_reason":"tool_use","content":[{"type":"tool_use","name":"myr_action","input":action}]})
         } else {

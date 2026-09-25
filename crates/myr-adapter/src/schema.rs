@@ -15,14 +15,27 @@ pub fn accounting_parts(
     schema: &Value,
     shared_schema: &Value,
 ) -> Result<Vec<SchemaPart>, myr_core::ValidationError> {
-    let pointer = "/properties/action/anyOf";
+    // Multi-action envelopes list alternatives under `actions.items`; the
+    // planner's single-action envelope under `action`.
+    let pointer_of = |value: &Value| {
+        [
+            "/properties/actions/items/anyOf",
+            "/properties/action/anyOf",
+        ]
+        .into_iter()
+        .find(|p| value.pointer(p).is_some_and(Value::is_array))
+    };
+    let pointer = pointer_of(schema)
+        .ok_or_else(|| myr_core::invalid("missing schema action alternatives"))?;
+    let shared_pointer = pointer_of(shared_schema)
+        .ok_or_else(|| myr_core::invalid("missing shared schema action alternatives"))?;
     let actions = schema
         .pointer(pointer)
         .and_then(Value::as_array)
         .filter(|a| !a.is_empty())
         .ok_or_else(|| myr_core::invalid("missing schema action alternatives"))?;
     let shared = shared_schema
-        .pointer(pointer)
+        .pointer(shared_pointer)
         .and_then(Value::as_array)
         .ok_or_else(|| myr_core::invalid("missing shared schema action alternatives"))?;
     let declarations: Vec<String> = actions.iter().map(Value::to_string).collect();
@@ -37,7 +50,7 @@ pub fn accounting_parts(
     let mut shared_envelope = shared_schema.clone();
     *envelope.pointer_mut(pointer).expect("checked pointer") = json!([]);
     *shared_envelope
-        .pointer_mut(pointer)
+        .pointer_mut(shared_pointer)
         .expect("checked pointer") = json!([]);
     let envelope_is_protocol = envelope != shared_envelope;
     let mut parts = vec![SchemaPart {
@@ -93,8 +106,13 @@ fn reference(kind: Option<&str>) -> Value {
         ])
     });
     record(
-        json!({"kind":{"type":"string","enum":kinds},"cid":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"}}),
+        json!({"kind":{"type":"string","enum":kinds},"cid":{"type":"string","pattern":"^(b3:[0-9a-f]{64}|@[0-7])$"}}),
     )
+}
+/// Multi-action response envelope shared by both pipelines (step C2). The
+/// 1..=8 bound is enforced at runtime, not in the schema.
+fn envelope(actions: Vec<Value>) -> Value {
+    record(json!({"actions":{"type":"array","items":{"anyOf":actions}}}))
 }
 fn list(items: Value) -> Value {
     json!({"type":"array","items":items})
@@ -108,6 +126,7 @@ fn text() -> Value {
 fn shared_actions() -> Vec<Value> {
     vec![
         action("fetch", json!({"reference":reference(None)})),
+        action("fetch_many", json!({"references":list(reference(None))})),
         action("put_artifact", json!({"content_base64":text()})),
         action("finish", json!({})),
     ]
@@ -139,7 +158,7 @@ pub fn prose_response_schema(role: Role, recipients: &[&str]) -> Value {
         )),
         Role::Planner => {}
     }
-    record(json!({"action":{"anyOf":actions}}))
+    envelope(actions)
 }
 
 /// Union of every prose-baseline declaration. Myr passes it as the shared
@@ -151,7 +170,8 @@ pub fn prose_shared_schema() -> Value {
         (Role::Worker, &PROSE_RECIPIENTS[1..]),
         (Role::Reviewer, &[][..]),
     ] {
-        for declaration in prose_response_schema(role, recipients)["properties"]["action"]["anyOf"]
+        for declaration in prose_response_schema(role, recipients)["properties"]["actions"]["items"]
+            ["anyOf"]
             .as_array()
             .expect("prose schema actions")
         {
@@ -160,7 +180,7 @@ pub fn prose_shared_schema() -> Value {
             }
         }
     }
-    record(json!({"action":{"anyOf":actions}}))
+    envelope(actions)
 }
 
 pub fn response_schema(role: Role) -> Value {
@@ -186,7 +206,7 @@ pub fn response_schema(role: Role) -> Value {
         actions.push(action("emit_delta", json!({"path":text(),"base_ref":reference(Some("ARTIFACT")),"patch_ref":reference(Some("ARTIFACT")),"codec":{"type":"string","enum":["REPLACEMENT","UNIFIED_DIFF"]},"result_ref":reference(Some("ARTIFACT")),"assumptions":list(reference(Some("ASSUMPTION")))})));
         actions.push(action("emit_fail", json!({"code":{"type":"string","enum":["PROVIDER_UNAVAILABLE","SANDBOX_UNAVAILABLE","IO_FAILURE","INVALID_AGENT_OUTPUT","INVALID_GOAL","CONFLICTING_OBLIGATIONS","CAPABILITY_DENIED","TOKEN_BUDGET","CALL_BUDGET","TIME_BUDGET","MISSING_REFERENCE","INVALIDATED_REFERENCE","RUNTIME_ERROR"]},"diagnostic_ref":reference(Some("ARTIFACT"))})));
     }
-    record(json!({"action":{"anyOf":actions}}))
+    envelope(actions)
 }
 
 #[cfg(test)]
@@ -196,10 +216,10 @@ mod tests {
     fn accounting_partition_covers_exact_bytes_and_requires_identical_declarations() {
         let schema = response_schema(Role::Worker);
         let mut shared = schema.clone();
-        shared["properties"]["action"]["anyOf"]
+        shared["properties"]["actions"]["items"]["anyOf"]
             .as_array_mut()
             .unwrap()
-            .truncate(3);
+            .truncate(4);
         let parts = accounting_parts(&schema, &shared).unwrap();
         assert_eq!(
             parts.iter().map(|p| p.text.as_str()).collect::<String>(),
@@ -208,7 +228,7 @@ mod tests {
         assert_eq!(parts.iter().filter(|p| p.protocol_only).count(), 4);
         assert!(!parts[1].protocol_only);
         // Same tool name with a changed signature is no longer a shared schema.
-        shared["properties"]["action"]["anyOf"][0]["description"] = "different".into();
+        shared["properties"]["actions"]["items"]["anyOf"][0]["description"] = "different".into();
         let parts = accounting_parts(&schema, &shared).unwrap();
         assert!(parts[1].protocol_only);
         assert!(!parts[2].protocol_only);
@@ -233,9 +253,9 @@ mod tests {
                 .map(|p| p.protocol_only)
                 .collect();
             let expected_protocol = if role == Role::Worker { 4 } else { 1 };
-            assert_eq!(exempt[..3], [false, false, false]);
-            assert_eq!(exempt[3..].len(), expected_protocol);
-            assert!(exempt[3..].iter().all(|p| *p));
+            assert_eq!(exempt[..4], [false, false, false, false]);
+            assert_eq!(exempt[4..].len(), expected_protocol);
+            assert!(exempt[4..].iter().all(|p| *p));
         }
         // Inside the baseline pipeline nothing is protocol schema.
         let worker = prose_response_schema(Role::Worker, &PROSE_RECIPIENTS[1..]);
@@ -245,7 +265,7 @@ mod tests {
                 .iter()
                 .all(|p| !p.protocol_only)
         );
-        let names: Vec<_> = shared["properties"]["action"]["anyOf"]
+        let names: Vec<_> = shared["properties"]["actions"]["items"]["anyOf"]
             .as_array()
             .unwrap()
             .iter()
@@ -255,6 +275,7 @@ mod tests {
             names,
             [
                 "fetch",
+                "fetch_many",
                 "put_artifact",
                 "finish",
                 "send_message",

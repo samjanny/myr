@@ -51,7 +51,47 @@ Updated: 2026-09-25. Goal remains active and incomplete.
     dispatcher journals the authorship map.
   - **Subscription guard.** `--subscription-only` rejects API backends before a
     store is created.
-- The offline suite passes **168 tests on Linux** (Rust 1.95.0) with Clippy
+- Specification revision 2 (2026-09-25):
+  - **Review coverage.** Both reviewers must review every non-HEURISTIC CLAIM
+    the worker received from another agent.
+  - **Premise edges.** When the runtime accepts a worker DELTA, it adds
+    `depends_on` edges from it to those unresolved claims. The model neither
+    declares nor can omit them, and `mw0.cddl` is unchanged.
+  - **Delivery rule.** A candidate whose dependency closure contains such a
+    claim, without an active FACT and with valid contrary EVIDENCE, is not
+    delivered (NO_DELIVERY). The baseline keeps its REJECT. The difference in
+    reviewer visibility is declared as a protocol property.
+  - **Deferred.** Speculative re-execution after a contradiction is post-v0
+    work.
+  - **Tests.** Injected-response tests cover supported, contradicted, omitted
+    and no-DELTA cases, plus premise validation.
+- Communication-cost pilot in progress (`docs/cost-pilot.md`). In state 0,
+  MW/0 used a median of 110.6k communication tokens over 40 calls, against
+  2.6k over 15 for the baseline; `fetch` accounts for 25–31 MW/0 calls. Two
+  implementation steps are done, identically in both pipelines, and covered by
+  offline tests:
+  - step A: shared UTF-8 text rendering of fetched artifacts;
+  - step C: a shared `fetch_many` with per-item accounting.
+
+  Live medians over two to three runs per state and pipeline:
+
+  | State | MW/0 comm tokens | MW/0 calls | Prose comm tokens | Ratio |
+  | --- | --- | --- | --- | --- |
+  | 0 | 110.6k | 40 | 2.6k | about 42 times |
+  | A | 76.1k | 41.5 | 2.6k | about 29 times |
+  | C | 50.4k | 20 | 2.0k | about 25 times |
+  | C + B1 + C2 | 27.7k | 13 | 0.96k | about 29 times |
+
+  The remaining MW/0 cost is mostly per-call schemas (planner about 3k, worker
+  about 1.1k) and MW renderings dominated by hexadecimal CIDs.
+  - Step B1 (planner schema without catalog CIDs) is deterministic: 3,091 to
+    1,566 tokens per planner call.
+  - Step C2 (several actions per response, with `@k` references, in both
+    pipelines) is implemented and measured live: MW/0 went from 20 to 13
+    responses. Prose improved proportionally, so the ratio no longer moves; the
+    remaining gap is protocol cost. See `docs/cost-pilot.md`.
+  - Step B2 (short textual CIDs) awaits an owner decision.
+- The offline suite passes **178 tests on Linux** (Rust 1.95.0) with Clippy
   (`-D warnings`) and rustfmt clean.
 - Live Docker confinement acceptance (2026-09-25) passes: the ignored test
   `tests/live_docker.rs` ran against local image `caddy:2-alpine` with Docker
@@ -353,9 +393,10 @@ Updated: 2026-09-25. Goal remains active and incomplete.
    baseline's communication tokens. Reduce MW_RENDER, schema and CAS volume,
    and the MW/0 call count, without changing the frozen counting rule. Revise
    the -25% threshold only through the pilot rule of Appendix C.4, before
-   freezing. Also: in MW/0 a reviewer's contradiction of the source CLAIM does
-   not block delivery unless the claim is a binding obligation, while baseline
-   reviewers can reject; confirm this asymmetry is intended.
+   freezing. The owner decided the order: text rendering of UTF-8 artifacts
+   (A), batched retrieval (C), then compact rendering (B). Shared tools change
+   in both pipelines; the baseline is remeasured after each step, with 2 live
+   runs per stage and pipeline plus a deterministic per-call cost measurement.
 4. Complete corpus checks, missing-data statistics, freezing, official runs, and
    report. Keep development evidence separate from official data.
 

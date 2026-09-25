@@ -31,7 +31,7 @@ exhaustion can remain historical data even though planning returns TIME_BUDGET.
 
 Tests inject provider responses through the real dispatcher and catalog boundary.
 They fetch repository content, create an ATOM, submit a mission-bound seal, verify
-schema refresh and accounting, and prove the same dispatcher's consumed budget
+catalog receipts and accounting, and prove the same dispatcher's consumed budget
 remains consumed afterward. Additional cases cover repairs, access denial,
 transport failure and a tighter local call limit. No live provider call is used.
 

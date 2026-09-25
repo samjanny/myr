@@ -251,7 +251,7 @@ mod tests {
             );
             lines.join("\n")
         };
-        let finish = r#"{"action":{"tool":"finish","arguments":{}}}"#;
+        let finish = r#"{"actions":[{"tool":"finish","arguments":{}}]}"#;
         // Unmarked commentary precedes the final structured answer.
         let body = turn(vec![
             message("Checking the claim.", None),
@@ -264,7 +264,7 @@ mod tests {
         // An explicit final answer wins even when commentary follows it.
         let body = turn(vec![
             message(finish, Some("final_answer")),
-            message("{\"action\":{}}", Some("commentary")),
+            message("{\"actions\":[]}", Some("commentary")),
         ]);
         assert_eq!(
             parse_completion(body.as_bytes()).unwrap().raw_output,
@@ -310,7 +310,7 @@ mod tests {
     fn complete_turn_required_and_native_tool_events_rejected() {
         let events = [
             json!({"type":"thread.started","thread_id":"fixture"}),
-            json!({"type":"item.completed","item":{"type":"agent_message","text":"{\"action\":{\"tool\":\"finish\",\"arguments\":{}}}"}}),
+            json!({"type":"item.completed","item":{"type":"agent_message","text":"{\"actions\":[{\"tool\":\"finish\",\"arguments\":{}}]}"}}),
             json!({"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":4}}),
         ];
         let body = events

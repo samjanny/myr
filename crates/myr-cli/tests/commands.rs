@@ -261,8 +261,10 @@ fn run_preparation_preserves_bytes_and_failed_execution_records_partial() {
     let seal_policy: myr_runner::goal::SealPolicy =
         serde_json::from_value(prepared["policy"].clone()).unwrap();
     assert!(seal_policy.verifier_policies.contains(&procedure.command));
+    // The planner schema constrains reference syntax only; catalog CIDs are
+    // not enumerated (cost pilot, step B).
     assert!(
-        prepared["planner_schema"]
+        !prepared["planner_schema"]
             .to_string()
             .contains(&measurement_ref.cid.to_string())
     );

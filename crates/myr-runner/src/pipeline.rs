@@ -62,6 +62,11 @@ pub struct Report {
     pub private_dispatch_checkpoint: Option<ObjectRef>,
     /// With a source view: whether shared CAS stayed free of private-only blobs.
     pub source_blobs_absent: Option<bool>,
+    /// Revision 2: non-HEURISTIC inter-agent CLAIMs the worker received.
+    pub received_claims: Vec<ObjectRef>,
+    /// Received CLAIMs without an active FACT and with valid contrary
+    /// EVIDENCE. Any entry prevents delivery of the candidate.
+    pub blocked_claims: Vec<ObjectRef>,
 }
 
 pub struct Outcome {
@@ -273,6 +278,7 @@ fn execution(
     task::Execution {
         review_context: context,
         private_view: None,
+        premises: vec![],
         slot,
         provider: provider.clone(),
         session: SessionConfig {
@@ -445,6 +451,8 @@ fn run_existing_with(
         accounting: Default::default(),
         private_dispatch_checkpoint: None,
         source_blobs_absent: None,
+        received_claims: vec![],
+        blocked_claims: vec![],
     };
     let baseline_files: BTreeSet<ObjectRef> =
         serde_json::from_slice::<std::collections::BTreeMap<String, ObjectRef>>(
@@ -530,6 +538,13 @@ fn run_existing_with(
             );
         }
     }
+    // Revision 2: every non-HEURISTIC CLAIM the worker receives from another
+    // agent must be reviewed, and a contradicted, unpromoted one blocks delivery.
+    for reference in forwarded.iter().filter(|r| r.kind == Kind::Claim) {
+        if claim_class(graph, *reference)? != PredicateClass::Heuristic {
+            report.received_claims.push(*reference);
+        }
+    }
     let worker = goal::issue_task(
         graph,
         goal_ref,
@@ -553,11 +568,11 @@ fn run_existing_with(
             instruction: config.worker_instruction,
         },
     )?;
-    let result = driver.task(
-        graph,
-        dispatcher,
-        execution(&sealed, config, RoleSlot::Worker, worker, None),
-    );
+    let mut worker_execution = execution(&sealed, config, RoleSlot::Worker, worker, None);
+    // Every received claim is still unresolved while the worker runs: reviews
+    // come after the candidate in the fixed pipeline.
+    worker_execution.premises = report.received_claims.clone();
+    let result = driver.task(graph, dispatcher, worker_execution);
     let work = match result {
         Ok(result) => result,
         Err(error) => {
@@ -764,12 +779,17 @@ fn run_existing_with(
                         }
                     }
                 }
-                if !result.finished || claims.iter().any(|c| !reviewed.contains(c)) {
+                if !result.finished
+                    || claims
+                        .iter()
+                        .chain(report.received_claims.iter())
+                        .any(|c| !reviewed.contains(c))
+                {
                     fail(
                         graph,
                         &mut report,
                         FailCode::InvalidAgentOutput,
-                        "Reviewer did not finish a bound review of every binding claim",
+                        "Reviewer did not finish a bound review of every binding and received claim",
                     )?;
                 }
                 report.stages.push(Stage { slot, task, result });
@@ -784,6 +804,24 @@ fn run_existing_with(
             FailCode::TimeBudget,
             "Mission deadline reached",
         )?;
+    }
+    // Structural delivery rule: query the candidate's dependency closure. Its
+    // CLAIMs can only come from runtime premise edges on the worker's DELTAs.
+    for claim in graph
+        .dependencies(candidate.reference())
+        .map_err(crate::Error::from)?
+        .into_iter()
+        .filter(|r| r.kind == Kind::Claim)
+    {
+        if claim_class(graph, claim)? != PredicateClass::Heuristic
+            && graph
+                .active_fact(claim)
+                .map_err(crate::Error::from)?
+                .is_none()
+            && contradicted(graph, claim)?
+        {
+            report.blocked_claims.push(claim);
+        }
     }
     match acceptance::assess_candidate(graph, audit, candidate.reference()) {
         Ok(assessment) => report.acceptance = Some(assessment),
@@ -803,6 +841,49 @@ fn run_existing_with(
         config,
         &baseline_files,
     )
+}
+
+fn claim_class(graph: &Graph, claim: ObjectRef) -> crate::Result<PredicateClass> {
+    let Object::Claim(claim) = graph.get(claim)? else {
+        return Err(invalid("expected CLAIM").into());
+    };
+    let Object::Atom(atom) = graph.get(claim.atom)? else {
+        return Err(invalid("expected ATOM").into());
+    };
+    let Object::PredicateDef(predicate) = graph.get(atom.predicate)? else {
+        return Err(invalid("expected PREDICATE_DEF").into());
+    };
+    Ok(predicate.class)
+}
+
+/// Valid contrary EVIDENCE in the claim's exact scope (Appendix B.1): a live
+/// CONTRADICTS on the claim, or a live SUPPORTS on the opposite polarity.
+fn contradicted(graph: &Graph, reference: ObjectRef) -> crate::Result<bool> {
+    let Object::Claim(claim) = graph.get(reference)? else {
+        return Err(invalid("expected CLAIM").into());
+    };
+    let opposite = myr_wire::identify(&Object::Claim(Claim {
+        polarity: !claim.polarity,
+        ..claim.clone()
+    }))?
+    .0;
+    for (target, contrary) in [
+        (reference, Verdict::Contradicts),
+        (opposite, Verdict::Supports),
+    ] {
+        if !graph.live(target)? {
+            continue;
+        }
+        for evidence in graph.live_evidence(target)? {
+            let Object::Evidence(evidence) = graph.get(evidence)? else {
+                unreachable!()
+            };
+            if evidence.verdict == contrary {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Machine-readable proof recorded as the CONFLICTING_OBLIGATIONS diagnostic.
@@ -898,6 +979,7 @@ fn finish(
         && report.stages.len() == 3 + usize::from(config.source.is_some())
         && report.stages.iter().all(|s| s.result.finished)
         && report.source_blobs_absent != Some(false)
+        && report.blocked_claims.is_empty()
         && report
             .acceptance
             .as_ref()
@@ -963,6 +1045,64 @@ mod tests {
         commands: usize,
     }
     const PRIVATE: &[u8] = b"baseline // thread-safe";
+
+    /// Whether a CLAIM is the runtime claim of a sealed binding criterion.
+    fn obligations_contain(graph: &Graph, goal_ref: ObjectRef, claim: ObjectRef) -> bool {
+        let Object::Claim(claim) = graph.get(claim).unwrap() else {
+            unreachable!()
+        };
+        let sealed = goal::load(graph, goal_ref).unwrap();
+        sealed
+            .ir()
+            .criteria
+            .iter()
+            .any(|c| c.binding && c.atom == claim.atom)
+    }
+
+    /// Recompile the fixture goal with one DECIDABLE and one HEURISTIC
+    /// mission predicate, keeping its criteria and policy.
+    fn with_mission_predicates(f: &mut Fixture) {
+        let sealed = goal::load(&f.graph, f.goal).unwrap();
+        let mut registry = sealed.ir().registry.clone();
+        for (name, class) in [
+            ("mission.fixture_fact", PredicateClass::Decidable),
+            ("mission.fixture_style", PredicateClass::Heuristic),
+        ] {
+            registry.push(
+                f.graph
+                    .insert(
+                        Authority::Compiler,
+                        &Object::PredicateDef(PredicateDef {
+                            name: name.into(),
+                            version: 1,
+                            arguments: vec![],
+                            semantics: format!("Fixture predicate {name}."),
+                            class,
+                            provenance: Some(f.policy),
+                        }),
+                    )
+                    .unwrap(),
+            );
+        }
+        f.goal = goal::compile(
+            &mut f.graph,
+            goal::GoalIr {
+                goal: sealed.ir().goal.clone(),
+                registry,
+                criteria: sealed.ir().criteria.clone(),
+                assumptions: vec![],
+            },
+            goal::SealPolicy {
+                // Received claims add reviews; keep budgets and the deadline
+                // from interfering, even on a loaded test machine.
+                call_budget: 50,
+                time_budget_ms: 600_000,
+                ..sealed.policy().clone()
+            },
+        )
+        .unwrap()
+        .reference();
+    }
     impl Driver for Simulated {
         fn task(
             &mut self,
@@ -981,6 +1121,42 @@ mod tests {
             let Object::Task(task) = graph.get(execution.session.task).unwrap() else {
                 unreachable!()
             };
+            if slot == RoleSlot::Planner && self.mode.starts_with("claims_") {
+                // Source pass emitting one DECIDABLE and one HEURISTIC claim.
+                let sealed = goal::load(graph, task.scope.goal).unwrap();
+                let predicates: Vec<_> = sealed
+                    .ir()
+                    .registry
+                    .iter()
+                    .copied()
+                    .filter(|r| {
+                        let Object::PredicateDef(p) = graph.get(*r).unwrap() else {
+                            unreachable!()
+                        };
+                        p.name.starts_with("mission.")
+                    })
+                    .collect();
+                let mut calls = 0;
+                return task::run_with(graph, dispatcher, execution, |_, _| {
+                    let action = match predicates.get(calls) {
+                        Some(predicate) => Action::EmitClaim {
+                            predicate_ref: *predicate,
+                            arguments: vec![],
+                            polarity: true,
+                        },
+                        None => Action::Finish {},
+                    };
+                    calls += 1;
+                    Ok(Completion {
+                        raw_output: serde_json::to_vec(&Response {
+                            actions: vec![action],
+                        })
+                        .unwrap(),
+                        usage: Usage::default(),
+                        observed_model: Some("fixture".into()),
+                    })
+                });
+            }
             if slot == RoleSlot::Planner {
                 // Source pass: read the private file, try to read worker_view and
                 // republish the private file verbatim (both rejected), quote
@@ -990,10 +1166,11 @@ mod tests {
                 let shared = ObjectRef::new(Kind::Artifact, myr_wire::artifact_cid(b"baseline"));
                 return task::run_with(graph, dispatcher, execution, |_, request| {
                     match calls {
-                        1 => assert!(request.prompt.contains(&base64::Engine::encode(
-                            &base64::engine::general_purpose::STANDARD,
-                            PRIVATE
-                        ))),
+                        1 => assert!(
+                            request
+                                .prompt
+                                .contains(r#""content_text":"baseline // thread-safe""#)
+                        ),
                         2 => assert!(request.prompt.contains("only its private view")),
                         3 => assert!(request.prompt.contains("duplicates a private source file")),
                         _ => {}
@@ -1015,7 +1192,10 @@ mod tests {
                     };
                     calls += 1;
                     Ok(Completion {
-                        raw_output: serde_json::to_vec(&Response { action }).unwrap(),
+                        raw_output: serde_json::to_vec(&Response {
+                            actions: vec![action],
+                        })
+                        .unwrap(),
                         usage: Usage::default(),
                         observed_model: Some("fixture".into()),
                     })
@@ -1030,6 +1210,23 @@ mod tests {
                 .iter()
                 .copied()
                 .filter(|r| r.kind == Kind::Claim)
+                .collect();
+            // Reviewer A may contradict or skip the claims other agents sent.
+            let plan: Vec<(ObjectRef, Verdict)> = claims
+                .iter()
+                .filter_map(|claim| {
+                    let class = claim_class(graph, *claim).unwrap();
+                    let received = !obligations_contain(graph, task.scope.goal, *claim);
+                    if slot == RoleSlot::ReviewerA && received {
+                        if self.mode == "claims_skipped" && class == PredicateClass::Decidable {
+                            return None;
+                        }
+                        if self.mode.starts_with("claims_contradicted") {
+                            return Some((*claim, Verdict::Contradicts));
+                        }
+                    }
+                    Some((*claim, Verdict::Supports))
+                })
                 .collect();
             let interrupt = (self.mode == "interrupt_worker" && slot == RoleSlot::Worker)
                 || (self.mode == "interrupt_reviewer" && slot == RoleSlot::ReviewerA);
@@ -1050,23 +1247,47 @@ mod tests {
                 let raw_output = if self.mode == "bad_worker" && slot == RoleSlot::Worker {
                     b"invalid response".to_vec()
                 } else {
+                    let edits = slot == RoleSlot::Worker
+                        && self.mode.starts_with("claims_")
+                        && self.mode != "claims_contradicted_no_delta";
                     let action = if interrupt && slot == RoleSlot::Worker && calls == 0 {
                         Action::PutArtifact {
                             content_base64: "eA==".into(),
                         }
+                    } else if edits && calls == 0 {
+                        Action::PutArtifact {
+                            content_base64: "Y2hhbmdlZA==".into(),
+                        }
+                    } else if edits && calls == 1 {
+                        let changed =
+                            ObjectRef::new(Kind::Artifact, myr_wire::artifact_cid(b"changed"));
+                        Action::EmitDelta {
+                            path: "f".into(),
+                            base_ref: ObjectRef::new(
+                                Kind::Artifact,
+                                myr_wire::artifact_cid(b"baseline"),
+                            ),
+                            patch_ref: changed,
+                            result_ref: changed,
+                            codec: DeltaCodec::Replacement,
+                            assumptions: vec![],
+                        }
                     } else if slot == RoleSlot::Worker
                         || self.mode == "empty_review"
-                        || calls >= claims.len()
+                        || calls >= plan.len()
                     {
                         Action::Finish {}
                     } else {
                         Action::ReviewClaim {
-                            claim_ref: claims[calls],
-                            verdict: Verdict::Supports,
+                            claim_ref: plan[calls].0,
+                            verdict: plan[calls].1,
                             rationale_ref: task.instruction,
                         }
                     };
-                    serde_json::to_vec(&Response { action }).unwrap()
+                    serde_json::to_vec(&Response {
+                        actions: vec![action],
+                    })
+                    .unwrap()
                 };
                 calls += 1;
                 Ok(Completion {
@@ -1145,6 +1366,105 @@ mod tests {
                 executable: f._dir.path().join("never-spawned"),
             },
             source: None,
+        }
+    }
+
+    #[test]
+    fn contradicted_unpromoted_received_claims_block_delivery() {
+        for mode in [
+            "claims_supported",
+            "claims_contradicted",
+            "claims_skipped",
+            "claims_contradicted_no_delta",
+        ] {
+            let mut f = Fixture::new(true);
+            with_mission_predicates(&mut f);
+            let mut config = config(&mut f);
+            let instruction = f
+                .graph
+                .register_artifact(crate::source::INSTRUCTION.as_bytes())
+                .unwrap();
+            config.source = Some(SourcePass {
+                instruction,
+                view: crate::source::SourceView::new(crate::views::Tree::from([(
+                    "f".into(),
+                    PRIVATE.to_vec(),
+                )]))
+                .unwrap()
+                .private_view(),
+            });
+            let mut driver = Simulated {
+                mode,
+                policy: f.policy,
+                commands: 0,
+            };
+            let report = run_with(&mut f.graph, &f.audit, f.goal, &config, &mut driver)
+                .unwrap()
+                .report;
+            // Only the DECIDABLE claim is received for review; HEURISTIC never blocks.
+            assert_eq!(report.received_claims.len(), 1, "{mode}");
+            let received = report.received_claims[0];
+            assert_eq!(
+                claim_class(&f.graph, received).unwrap(),
+                PredicateClass::Decidable
+            );
+            let codes: Vec<_> = report
+                .failures
+                .iter()
+                .map(|r| {
+                    let Object::Fail(fail) = f.graph.get(*r).unwrap() else {
+                        unreachable!()
+                    };
+                    fail.code
+                })
+                .collect();
+            // The runtime, not the model, linked every accepted DELTA to the
+            // unresolved received claim.
+            let manifest = candidate::load_manifest(&f.graph, report.candidate.unwrap()).unwrap();
+            let premise_in_closure = f
+                .graph
+                .dependencies(report.candidate.unwrap())
+                .unwrap()
+                .contains(&received);
+            assert_eq!(
+                premise_in_closure,
+                mode != "claims_contradicted_no_delta",
+                "{mode}"
+            );
+            assert_eq!(manifest.deltas.is_empty(), !premise_in_closure);
+            match mode {
+                "claims_contradicted_no_delta" => {
+                    // A candidate identical to the baseline cannot carry the
+                    // contradicted premise: nothing in its closure blocks it.
+                    assert!(f.graph.active_fact(received).unwrap().is_none());
+                    assert!(report.blocked_claims.is_empty());
+                    assert_eq!(report.state, MissionState::Complete);
+                }
+                "claims_supported" => {
+                    // Two lineages support it: promoted, delivered.
+                    assert!(f.graph.active_fact(received).unwrap().is_some());
+                    assert!(report.blocked_claims.is_empty());
+                    assert_eq!(report.state, MissionState::Complete);
+                }
+                "claims_contradicted" => {
+                    // One contrary LLM review: unpromoted and blocking, even though
+                    // the binding obligation itself is proven. No FAIL is recorded.
+                    assert!(f.graph.active_fact(received).unwrap().is_none());
+                    assert_eq!(report.blocked_claims, vec![received]);
+                    assert!(report.failures.is_empty());
+                    assert!(report.acceptance.as_ref().unwrap().all_binding_proven());
+                    assert_eq!(report.state, MissionState::Partial);
+                    assert_eq!(
+                        crate::collection::classify_run(false, &codes),
+                        crate::collection::RunDisposition::NoDelivery
+                    );
+                }
+                _ => {
+                    // Omitting a received claim is not INCONCLUSIVE: it is invalid.
+                    assert_eq!(codes, vec![FailCode::InvalidAgentOutput]);
+                    assert_eq!(report.state, MissionState::Partial);
+                }
+            }
         }
     }
 

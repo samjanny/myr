@@ -20,6 +20,29 @@ The CLAIMs, ATTESTs, assumption proposals and artifacts it emits become inputs
 of the worker and both reviewer TASKs. Completion then requires four finished
 stages and `source_blobs_absent`.
 
+Revision 2 delivery rule. The source-pass CLAIMs whose predicate is not
+HEURISTIC become the report's `received_claims`, and also the worker's
+`premises`. When the task loop accepts a DELTA, it adds a `depends_on` edge
+from that DELTA to every premise. Task setup rejects premises that are not
+CLAIMs in the task's inputs.
+
+Both reviewers must review every received claim, as for binding claims; an
+omission is INVALID_AGENT_OUTPUT. After the reviews, the pipeline walks the
+candidate's dependency closure. A non-HEURISTIC CLAIM there, without an active
+FACT and with valid contrary EVIDENCE, is listed in `blocked_claims`. Valid
+contrary EVIDENCE is a live CONTRADICTS, or a live SUPPORTS on the opposite
+polarity (Appendix B.1). Any blocked claim prevents COMPLETE even when every
+binding obligation is proven, and the run disposition becomes NO_DELIVERY.
+
+Tests cover four cases:
+- supported: the claim is promoted and the candidate delivered;
+- contradicted: delivery is blocked and no FAIL is recorded;
+- omitted review: INVALID_AGENT_OUTPUT;
+- contradicted with no DELTA: the baseline candidate is delivered, because its
+  closure contains no premise.
+
+They also confirm that HEURISTIC claims never block.
+
 The worker TASK depends on every pending assumption sealed in the Goal IR: those
 choices materialize as ASSUMPTION objects when the worker is issued, because the
 worker produces the artifacts they affect. Its inputs also include the sealed

@@ -237,7 +237,7 @@ mod tests {
     }
     #[test]
     fn plain_prose_and_error_results_never_enter_structured_channel() {
-        let result = json!({"type":"result","subtype":"success","is_error":false,"structured_output":{"action":{"tool":"finish","arguments":{}}},"modelUsage":{"observed-checkpoint":{}},"usage":{"input_tokens":7,"output_tokens":3}});
+        let result = json!({"type":"result","subtype":"success","is_error":false,"structured_output":{"actions":[{"tool":"finish","arguments":{}}]},"modelUsage":{"observed-checkpoint":{}},"usage":{"input_tokens":7,"output_tokens":3}});
         let completion = parse_completion(&serde_json::to_vec(&result).unwrap()).unwrap();
         assert_eq!(
             completion.observed_model.as_deref(),

@@ -7,7 +7,7 @@ use crate::{
     dispatch::{Call, Dispatcher},
 };
 use myr_adapter::{
-    Action, Outcome, Response, Session, SessionConfig,
+    Action, Outcome, Session, SessionConfig,
     config::ProviderConfig,
     transport::{self, Completion, Request},
 };
@@ -19,6 +19,10 @@ pub struct Execution {
     pub review_context: Option<ObjectRef>,
     /// Planner source pass only: the harness-private source view.
     pub private_view: Option<crate::source::PrivateView>,
+    /// Runtime-selected unresolved inter-agent CLAIMs in this task's inputs.
+    /// Every DELTA the runtime accepts from the task gets a `depends_on` edge
+    /// to each of them; the model can neither add nor omit these edges.
+    pub premises: Vec<ObjectRef>,
     pub slot: myr_adapter::config::RoleSlot,
     pub session: SessionConfig,
     pub provider: ProviderConfig,
@@ -113,6 +117,16 @@ pub(crate) fn run_with(
         return Err(crate::Error::from(invalid("task runner requires TASK")).into());
     };
     let sealed = crate::goal::load(graph, task.scope.goal)?;
+    if execution
+        .premises
+        .iter()
+        .any(|p| p.kind != Kind::Claim || !task.inputs.contains(p))
+    {
+        return Err(crate::Error::from(invalid(
+            "task premises must be CLAIMs among the task's inputs",
+        ))
+        .into());
+    }
     if execution.session.role != execution.slot.role()
         || &execution.provider != sealed.policy().providers.get(execution.slot)
     {
@@ -245,74 +259,116 @@ pub(crate) fn run_with(
             if !graph.live(task_ref).map_err(crate::Error::from)? {
                 return failure(graph, task_ref, &objects, FailCode::InvalidatedReference);
             }
-            let response = serde_json::from_slice::<Response>(&completion.raw_output).ok();
-            let outcome = session.handle(graph, &completion.raw_output)?;
-            match outcome {
-                Outcome::Applied {
-                    fetched_raw_bytes,
-                    objects: emitted,
-                    result,
-                    done,
-                } => {
-                    // Retain committed outputs before any subsequent fallible audit.
-                    objects.extend(emitted.iter().copied());
-                    if matches!(
-                        response.as_ref().map(|r| &r.action),
-                        Some(Action::PutArtifact { .. })
-                    ) {
-                        for reference in &emitted {
-                            dispatcher.record_artifact_origin(&agent, *reference);
+            let outcomes = match session.handle(graph, &completion.raw_output) {
+                Ok(outcomes) => outcomes,
+                Err(error) => {
+                    // Earlier actions of this response are already committed.
+                    objects.extend(session.committed().iter().copied());
+                    return Err(error.into());
+                }
+            };
+            history.push((SegmentKind::LocalTool, raw.unwrap_or_default().into()));
+            let mut finished = false;
+            for outcome in outcomes {
+                match outcome {
+                    Outcome::Applied {
+                        action,
+                        fetched_raw_bytes,
+                        fetched_items,
+                        objects: emitted,
+                        result,
+                        done,
+                    } => {
+                        // Retain committed outputs before any subsequent fallible audit.
+                        objects.extend(emitted.iter().copied());
+                        for delta in emitted.iter().filter(|r| r.kind == Kind::Delta) {
+                            for premise in &execution.premises {
+                                graph.depend(*delta, *premise).map_err(crate::Error::from)?;
+                            }
+                        }
+                        if matches!(*action, Action::PutArtifact { .. }) {
+                            for reference in &emitted {
+                                dispatcher.record_artifact_origin(&agent, *reference);
+                            }
+                        }
+                        for bytes in fetched_raw_bytes
+                            .iter()
+                            .chain(fetched_items.iter().flatten())
+                        {
+                            dispatcher.record_cas_read(*bytes)?;
+                        }
+                        if done {
+                            finished = true;
+                            continue;
+                        }
+                        // Classification by provenance; identical for single and
+                        // batched fetches.
+                        let classify = |reference: ObjectRef| {
+                            if reference == task.instruction {
+                                SegmentKind::Goal
+                            } else if reference.kind == Kind::Artifact {
+                                dispatcher.classify_artifact(
+                                    &agent,
+                                    reference,
+                                    &repository,
+                                    SegmentKind::CasReferenced,
+                                )
+                            } else {
+                                SegmentKind::MwRender
+                            }
+                        };
+                        match *action {
+                            Action::FetchMany { references } => {
+                                // One segment per item, so each keeps its own class.
+                                let items = result["items"].as_array().cloned().unwrap_or_default();
+                                for ((reference, item), bytes) in
+                                    references.into_iter().zip(items).zip(&fetched_items)
+                                {
+                                    if bytes.is_some() {
+                                        cas_segments.push(history.len());
+                                    }
+                                    history.push((classify(reference), item.to_string()));
+                                }
+                            }
+                            action => {
+                                let kind = match action {
+                                    Action::Fetch { reference } => classify(reference),
+                                    _ => SegmentKind::LocalTool,
+                                };
+                                if fetched_raw_bytes.is_some() {
+                                    cas_segments.push(history.len());
+                                }
+                                let receipt =
+                                    serde_json::json!({"objects":emitted,"result":result});
+                                history.push((
+                                    kind,
+                                    serde_json::to_string(&receipt).map_err(crate::Error::from)?,
+                                ));
+                            }
                         }
                     }
-                    if let Some(bytes) = fetched_raw_bytes {
-                        dispatcher.record_cas_read(bytes)?;
+                    Outcome::Repair { attempt, message } => {
+                        history.push((
+                            SegmentKind::ValidationFeedback,
+                            serde_json::json!({"repair_attempt":attempt,"message":message})
+                                .to_string(),
+                        ));
                     }
-                    let receipt = serde_json::json!({"objects":emitted,"result":result});
-                    if done {
+                    Outcome::Failed { failure } => {
                         return Ok(TaskResult {
-                            finished: true,
+                            finished: false,
                             objects: objects.clone(),
-                            failure: None,
+                            failure: Some(failure),
                         });
                     }
-                    let kind = match response.map(|r| r.action) {
-                        Some(Action::Fetch { reference }) if reference == task.instruction => {
-                            SegmentKind::Goal
-                        }
-                        Some(Action::Fetch { reference }) if reference.kind == Kind::Artifact => {
-                            dispatcher.classify_artifact(
-                                &agent,
-                                reference,
-                                &repository,
-                                SegmentKind::CasReferenced,
-                            )
-                        }
-                        Some(Action::Fetch { .. }) => SegmentKind::MwRender,
-                        _ => SegmentKind::LocalTool,
-                    };
-                    history.push((SegmentKind::LocalTool, raw.unwrap_or_default().into()));
-                    if fetched_raw_bytes.is_some() {
-                        cas_segments.push(history.len());
-                    }
-                    history.push((
-                        kind,
-                        serde_json::to_string(&receipt).map_err(crate::Error::from)?,
-                    ));
                 }
-                Outcome::Repair { attempt, message } => {
-                    history.push((SegmentKind::LocalTool, raw.unwrap_or_default().into()));
-                    history.push((
-                        SegmentKind::ValidationFeedback,
-                        serde_json::json!({"repair_attempt":attempt,"message":message}).to_string(),
-                    ));
-                }
-                Outcome::Failed { failure } => {
-                    return Ok(TaskResult {
-                        finished: false,
-                        objects: objects.clone(),
-                        failure: Some(failure),
-                    });
-                }
+            }
+            if finished {
+                return Ok(TaskResult {
+                    finished: true,
+                    objects: objects.clone(),
+                    failure: None,
+                });
             }
         }
     })();
@@ -336,6 +392,7 @@ mod tests {
         accounting::Pipeline,
         views::{Tree, import_worker},
     };
+    use myr_adapter::Response;
     use myr_adapter::{Identity, Role, config::Backend};
     fn fixture(calls: u32) -> (tempfile::TempDir, Graph, Dispatcher, Execution) {
         let dir = tempfile::tempdir().unwrap();
@@ -439,6 +496,7 @@ mod tests {
         let execution = Execution {
             review_context: None,
             private_view: None,
+            premises: vec![],
             slot: myr_adapter::config::RoleSlot::Worker,
             session: SessionConfig {
                 task,
@@ -525,6 +583,7 @@ mod tests {
             let make_execution = |context| Execution {
                 review_context: Some(context),
                 private_view: None,
+                premises: vec![],
                 slot,
                 provider: provider.clone(),
                 session: SessionConfig {
@@ -564,16 +623,16 @@ mod tests {
                     if calls == 1 {
                         reply(
                             &serde_json::to_string(&Response {
-                                action: Action::ReviewClaim {
+                                actions: vec![Action::ReviewClaim {
                                     claim_ref: claim,
                                     verdict: Verdict::Supports,
                                     rationale_ref: original_task.instruction,
-                                },
+                                }],
                             })
                             .unwrap(),
                         )
                     } else {
-                        reply(r#"{"action":{"tool":"finish","arguments":{}}}"#)
+                        reply(r#"{"actions":[{"tool":"finish","arguments":{}}]}"#)
                     }
                 },
             )
@@ -617,10 +676,10 @@ mod tests {
         let result = run_with(&mut graph, &mut dispatcher, execution, |_, request| {
             calls += 1;
             if calls == 1 {
-                reply(r#"{"action":{"tool":"put_artifact","arguments":{"content_base64":"eA=="}}}"#)
+                reply(r#"{"actions":[{"tool":"put_artifact","arguments":{"content_base64":"eA=="}}]}"#)
             } else {
                 assert!(request.prompt.contains(&artifact.to_string()));
-                reply(r#"{"action":{"tool":"finish","arguments":{}}}"#)
+                reply(r#"{"actions":[{"tool":"finish","arguments":{}}]}"#)
             }
         })
         .unwrap();
@@ -631,6 +690,100 @@ mod tests {
             vec![ObjectRef::new(Kind::Artifact, artifact)]
         );
         assert_eq!(dispatcher.attempts().len(), 2);
+    }
+    #[test]
+    fn fetch_many_returns_single_fetch_items_with_per_item_classes() {
+        let (_dir, mut graph, mut dispatcher, execution) = fixture(6);
+        let file = execution.session.baseline["f"];
+        let Object::Task(task) = graph.get(execution.session.task).unwrap() else {
+            panic!()
+        };
+        let instruction = task.instruction;
+        let instruction_len = graph.cas().get(instruction).unwrap().len() as u64;
+        let outside = ObjectRef::new(Kind::Artifact, myr_wire::artifact_cid(b"not in closure"));
+        let many = |references: Vec<ObjectRef>| {
+            serde_json::to_string(&Response {
+                actions: vec![Action::FetchMany { references }],
+            })
+            .unwrap()
+        };
+        let mut sent = 0;
+        let result = run_with(&mut graph, &mut dispatcher, execution, |_, request| {
+            sent += 1;
+            match sent {
+                // An unauthorized item rejects the whole batch: nothing is shown.
+                1 => reply(&many(vec![file, outside])),
+                2 => {
+                    assert!(request.prompt.contains("repair_attempt"));
+                    assert!(!request.prompt.contains(r#""content_text":"original""#));
+                    reply(&many(vec![file, file]))
+                }
+                3 => reply(&many(vec![file, instruction])),
+                _ => {
+                    assert!(request.prompt.contains(r#""content_text":"original""#));
+                    reply(r#"{"actions":[{"tool":"finish","arguments":{}}]}"#)
+                }
+            }
+        })
+        .unwrap();
+        assert!(result.finished);
+        // Each item is its own segment with its own provenance class.
+        let last = dispatcher.accounting().calls().last().unwrap();
+        let kinds: Vec<_> = last.segments.iter().map(|s| s.kind).collect();
+        assert!(kinds.contains(&SegmentKind::DirectRepo));
+        assert!(kinds.contains(&SegmentKind::Goal));
+        assert!(
+            last.segments
+                .iter()
+                .filter(|s| matches!(s.kind, SegmentKind::DirectRepo | SegmentKind::Goal))
+                .all(|s| s.cas_derived)
+        );
+        // Only the accepted batch counts as retrieval traffic.
+        assert_eq!(
+            dispatcher.accounting().totals().cas_raw_bytes,
+            b"original".len() as u64 + instruction_len
+        );
+    }
+    #[test]
+    fn one_response_can_chain_actions_through_placeholders() {
+        let (_dir, mut graph, mut dispatcher, execution) = fixture(5);
+        let result = run_with(&mut graph, &mut dispatcher, execution, |_, _| {
+            reply(
+                &serde_json::json!({"actions":[
+                    {"tool":"put_artifact","arguments":{"content_base64":"eA=="}},
+                    {"tool":"emit_assumption","arguments":{"question":"Which?","chosen":"A","alternatives":["B"],
+                        "rationale_ref":{"kind":"ARTIFACT","cid":"@0"},"artifacts":[]}},
+                    {"tool":"finish","arguments":{}}
+                ]})
+                .to_string(),
+            )
+        })
+        .unwrap();
+        assert!(result.finished && result.failure.is_none());
+        assert_eq!(dispatcher.attempts().len(), 1);
+        let artifact = ObjectRef::new(Kind::Artifact, myr_wire::artifact_cid(b"x"));
+        assert_eq!(result.objects[0], artifact);
+        let Object::Assumption(assumption) = graph.get(result.objects[1]).unwrap() else {
+            panic!("expected assumption")
+        };
+        assert_eq!(assumption.rationale, artifact);
+    }
+    #[test]
+    fn premises_must_be_claims_among_the_task_inputs() {
+        for premise in [
+            ObjectRef::new(Kind::Claim, myr_core::Cid([7; 32])),
+            ObjectRef::new(Kind::Artifact, myr_wire::artifact_cid(b"original")),
+        ] {
+            let (_dir, mut graph, mut dispatcher, mut execution) = fixture(5);
+            execution.premises = vec![premise];
+            assert!(
+                run_with(&mut graph, &mut dispatcher, execution, |_, _| {
+                    panic!("invalid premises must be rejected before dispatch")
+                })
+                .is_err()
+            );
+            assert!(dispatcher.attempts().is_empty());
+        }
     }
     #[test]
     fn invalid_output_repairs_are_counted_and_third_invalid_response_fails() {
@@ -658,7 +811,7 @@ mod tests {
             let reference = execution.session.baseline["f"];
             let raw_len = graph.cas().get(reference).unwrap().len() as u64;
             let fetch = serde_json::to_string(&Response {
-                action: Action::Fetch { reference },
+                actions: vec![Action::Fetch { reference }],
             })
             .unwrap();
             let mut sent = 0;
@@ -669,7 +822,7 @@ mod tests {
                 if sent < 3 {
                     reply(&fetch)
                 } else {
-                    reply(r#"{"action":{"tool":"finish","arguments":{}}}"#)
+                    reply(r#"{"actions":[{"tool":"finish","arguments":{}}]}"#)
                 }
             })
             .unwrap();
@@ -710,9 +863,9 @@ mod tests {
         let (_dir, mut graph, mut dispatcher, execution) = fixture(3);
         let inaccessible = graph.register_artifact(b"outside task closure").unwrap();
         let denied = serde_json::to_string(&Response {
-            action: Action::Fetch {
+            actions: vec![Action::Fetch {
                 reference: inaccessible,
-            },
+            }],
         })
         .unwrap();
         let result = run_with(&mut graph, &mut dispatcher, execution, |_, _| {
@@ -740,9 +893,9 @@ mod tests {
         let error = run_with(&mut graph, &mut dispatcher, execution, |_, _| {
             calls += 1;
             reply(if calls == 1 {
-                r#"{"action":{"tool":"put_artifact","arguments":{"content_base64":"eA=="}}}"#
+                r#"{"actions":[{"tool":"put_artifact","arguments":{"content_base64":"eA=="}}]}"#
             } else {
-                r#"{"action":{"tool":"put_artifact","arguments":{"content_base64":"eQ=="}}}"#
+                r#"{"actions":[{"tool":"put_artifact","arguments":{"content_base64":"eQ=="}}]}"#
             })
         })
         .unwrap_err();
@@ -777,14 +930,14 @@ mod tests {
         assert!(execution.session.protected.is_empty());
         let base = execution.session.baseline["f"];
         let response = serde_json::to_string(&Response {
-            action: Action::EmitDelta {
+            actions: vec![Action::EmitDelta {
                 path: "f".into(),
                 base_ref: base,
                 patch_ref: base,
                 result_ref: base,
                 codec: DeltaCodec::Replacement,
                 assumptions: vec![],
-            },
+            }],
         })
         .unwrap();
         // The caller cannot remove a protection sealed in the goal.

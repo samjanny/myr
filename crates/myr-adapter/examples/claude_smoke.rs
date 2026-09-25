@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let request=Request {system:"You return one Myr action matching the supplied schema. Do not use native tools.".into(),prompt:"Return the finish action with an empty arguments object. This is a transport smoke test.".into(),schema:schema::response_schema(Role::Worker),max_output_tokens:512,timeout:std::time::Duration::from_secs(60)};
     let result = claude_code::complete(&config, &request)?;
     let action: myr_adapter::Response = serde_json::from_slice(&result.raw_output)?;
-    if !matches!(action.action, myr_adapter::Action::Finish {}) {
+    if !matches!(action.actions.as_slice(), [myr_adapter::Action::Finish {}]) {
         return Err("unexpected smoke-test action".into());
     }
     println!(

@@ -18,7 +18,22 @@ use std::{
 };
 
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+/// Fetch-receipt rendering shared by both pipelines: bytes that are valid
+/// UTF-8 without NUL appear as text, anything else as Base64. The rule is a
+/// frozen rendering choice, not an accounting rule: tokens are always counted
+/// on exactly this inserted representation.
+pub fn render_artifact(reference: ObjectRef, bytes: &[u8]) -> serde_json::Value {
+    match std::str::from_utf8(bytes) {
+        Ok(text) if !text.contains('\0') => {
+            serde_json::json!({"reference":reference,"content_text":text})
+        }
+        _ => serde_json::json!({"reference":reference,"content_base64":STANDARD.encode(bytes)}),
+    }
+}
 pub const MAX_ARTIFACT_BYTES: usize = 512 * 1024;
+/// Upper bound on references in one `fetch_many` action.
+pub const MAX_FETCH_MANY: usize = 16;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -34,10 +49,71 @@ pub struct Identity {
     pub lineage: Lineage,
 }
 
+/// One model turn: 1 to [`MAX_ACTIONS`] actions, applied in order (cost pilot
+/// step C2). A reference whose `cid` is `@k` names the object of that kind
+/// created by action `k` of the same response; the runtime resolves it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Response {
-    pub action: Action,
+    pub actions: Vec<Action>,
+}
+
+pub const MAX_ACTIONS: usize = 8;
+
+/// Split a raw response into its action values without interpreting them.
+pub fn response_actions(raw: &[u8]) -> Result<Vec<serde_json::Value>, String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(raw).map_err(|e| format!("JSON schema: {e}"))?;
+    let Some(object) = value.as_object().filter(|o| o.len() == 1) else {
+        return Err("response must contain only an actions array".into());
+    };
+    match object.get("actions").and_then(|a| a.as_array()) {
+        Some(actions) if (1..=MAX_ACTIONS).contains(&actions.len()) => Ok(actions.clone()),
+        _ => Err(format!("actions must hold 1 to {MAX_ACTIONS} actions")),
+    }
+}
+
+/// Replace `@k` placeholders with the unique object of the requested kind that
+/// action `k` of this response created. Anything else is left untouched.
+pub fn resolve_placeholders(
+    value: &mut serde_json::Value,
+    created: &[Vec<ObjectRef>],
+) -> Result<(), String> {
+    match value {
+        serde_json::Value::Object(map)
+            if map.len() == 2
+                && map
+                    .get("cid")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.starts_with('@')) =>
+        {
+            let index: usize = map["cid"].as_str().expect("checked")[1..]
+                .parse()
+                .map_err(|_| "invalid placeholder index".to_string())?;
+            let kind: Kind = serde_json::from_value(map.get("kind").cloned().unwrap_or_default())
+                .map_err(|_| "placeholder requires a kind".to_string())?;
+            let outputs = created
+                .get(index)
+                .ok_or_else(|| format!("placeholder @{index} names no earlier action"))?;
+            let mut matching = outputs.iter().filter(|r| r.kind == kind);
+            let (Some(reference), None) = (matching.next(), matching.next()) else {
+                return Err(format!("action {index} created no unique {kind:?}"));
+            };
+            map.insert("cid".into(), serde_json::json!(reference.cid.to_string()));
+        }
+        serde_json::Value::Object(map) => {
+            for child in map.values_mut() {
+                resolve_placeholders(child, created)?;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                resolve_placeholders(child, created)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -50,6 +126,11 @@ pub struct Response {
 pub enum Action {
     Fetch {
         reference: ObjectRef,
+    },
+    /// Batched retrieval: exactly the items individual fetches would return,
+    /// with the same authorization, in one round-trip.
+    FetchMany {
+        references: Vec<ObjectRef>,
     },
     PutArtifact {
         content_base64: String,
@@ -90,10 +171,17 @@ pub enum Action {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Outcome {
     Applied {
+        /// The applied action after placeholder resolution. Runtime metadata.
+        #[serde(skip_serializing)]
+        action: Box<Action>,
         /// Logical bytes returned by a successful fetch, before rendering.
         /// Runtime metadata, never supplied by the model or sent as a receipt.
         #[serde(skip_serializing)]
         fetched_raw_bytes: Option<u64>,
+        /// `fetch_many` only: per item, the logical shared-CAS bytes, or
+        /// `None` for a private-view read. Runtime metadata, never serialized.
+        #[serde(skip_serializing)]
+        fetched_items: Vec<Option<u64>>,
         objects: Vec<ObjectRef>,
         result: serde_json::Value,
         done: bool,
@@ -156,6 +244,9 @@ pub struct Session {
     quarantine: PathBuf,
     repair_errors: u8,
     ended: bool,
+    /// Objects committed by the response being handled, kept so a caller can
+    /// retain them if an infrastructure error interrupts a later action.
+    committed: Vec<ObjectRef>,
     review_context: Option<ObjectRef>,
     /// Harness-private source view, never stored in shared CAS or the graph.
     private: BTreeMap<ObjectRef, Vec<u8>>,
@@ -221,6 +312,7 @@ impl Session {
             quarantine: config.quarantine,
             repair_errors: 0,
             ended: false,
+            committed: vec![],
             review_context: None,
             private: BTreeMap::new(),
             private_only: BTreeSet::new(),
@@ -262,21 +354,26 @@ impl Session {
         Ok(())
     }
 
-    pub fn handle(&mut self, graph: &mut Graph, raw: &[u8]) -> Result<Outcome, Error> {
+    /// Objects committed by the most recent `handle` call, including those of
+    /// actions applied before an interrupting error.
+    pub fn committed(&self) -> &[ObjectRef] {
+        &self.committed
+    }
+
+    /// Apply one response's actions in order. Outputs of actions applied before
+    /// a rejected one remain committed; the rejection then follows the normal
+    /// repair or failure rules for the whole response.
+    pub fn handle(&mut self, graph: &mut Graph, raw: &[u8]) -> Result<Vec<Outcome>, Error> {
         if self.ended {
             return Err(Error::Ended);
         }
-        let parsed = if raw.len() > MAX_RESPONSE_BYTES {
-            Err(Rejection::Invalid("response exceeds size limit".into()))
-        } else {
-            serde_json::from_slice::<Response>(raw)
-                .map_err(|e| Rejection::Invalid(format!("JSON schema: {e}")))
-        };
-        let result = parsed.and_then(|response| self.apply(graph, response.action));
+        self.committed.clear();
+        let mut outcomes = Vec::new();
+        let result = self.apply_all(graph, raw, &mut outcomes);
         match result {
-            Ok(outcome) => {
+            Ok(()) => {
                 self.repair_errors = 0;
-                Ok(outcome)
+                Ok(outcomes)
             }
             Err(Rejection::Infrastructure(e)) => Err(e),
             Err(rejection) => {
@@ -287,11 +384,11 @@ impl Session {
                     Rejection::Infrastructure(_) => unreachable!(),
                 };
                 self.repair_errors += 1;
-                if !policy && self.repair_errors <= 2 {
-                    Ok(Outcome::Repair {
+                outcomes.push(if !policy && self.repair_errors <= 2 {
+                    Outcome::Repair {
                         attempt: self.repair_errors,
                         message: message.chars().take(320).collect(),
-                    })
+                    }
                 } else {
                     self.ended = true;
                     self.fail(
@@ -302,10 +399,54 @@ impl Session {
                             FailCode::InvalidAgentOutput
                         },
                         message.as_bytes(),
-                    )
+                    )?
+                });
+                Ok(outcomes)
+            }
+        }
+    }
+
+    fn apply_all(
+        &mut self,
+        graph: &mut Graph,
+        raw: &[u8],
+        outcomes: &mut Vec<Outcome>,
+    ) -> Result<(), Rejection> {
+        if raw.len() > MAX_RESPONSE_BYTES {
+            return Err(Rejection::Invalid("response exceeds size limit".into()));
+        }
+        let actions = response_actions(raw).map_err(Rejection::Invalid)?;
+        let count = actions.len();
+        let mut created = Vec::new();
+        for (index, mut value) in actions.into_iter().enumerate() {
+            let at = |m: String| format!("action {index}: {m}");
+            resolve_placeholders(&mut value, &created).map_err(|m| Rejection::Invalid(at(m)))?;
+            let action: Action = serde_json::from_value(value)
+                .map_err(|e| Rejection::Invalid(at(format!("JSON schema: {e}"))))?;
+            if matches!(action, Action::Finish {}) && index + 1 != count {
+                return Err(Rejection::Invalid(at(
+                    "finish must be the last action".into()
+                )));
+            }
+            let outcome = self.apply(graph, action).map_err(|r| match r {
+                Rejection::Invalid(m) => Rejection::Invalid(at(m)),
+                Rejection::Policy(m) => Rejection::Policy(at(m)),
+                infrastructure => infrastructure,
+            })?;
+            match &outcome {
+                Outcome::Applied { objects, .. } => {
+                    self.committed.extend(objects.iter().copied());
+                    created.push(objects.clone());
+                    outcomes.push(outcome);
+                }
+                _ => {
+                    // emit_fail ends the session; later actions are not applied.
+                    outcomes.push(outcome);
+                    return Ok(());
                 }
             }
         }
+        Ok(())
     }
 
     fn quarantine(&self, bytes: &[u8]) -> Result<(), Error> {
@@ -340,12 +481,40 @@ impl Session {
         Ok(Outcome::Failed { failure })
     }
 
+    /// One authorized read, rendered exactly as a single `fetch` receipt.
+    fn fetch_item(
+        &self,
+        graph: &Graph,
+        reference: ObjectRef,
+    ) -> Result<(serde_json::Value, Option<u64>), Rejection> {
+        if let Some(bytes) = self.private.get(&reference) {
+            // Private repository read: not shared CAS traffic.
+            return Ok((render_artifact(reference, bytes), None));
+        }
+        if !self.private.is_empty()
+            && reference.kind == Kind::Artifact
+            && reference != self.task.instruction
+            && !self.roots[1..].contains(&reference)
+        {
+            return Err(invalid("a source pass reads only its private view").into());
+        }
+        let bytes = self.accessible(graph, reference)?;
+        let item = if matches!(reference.kind, Kind::Artifact | Kind::Goal) {
+            render_artifact(reference, &bytes)
+        } else {
+            let object = myr_wire::decode(&bytes)?;
+            serde_json::json!({"reference":reference,"object":object})
+        };
+        Ok((item, Some(bytes.len() as u64)))
+    }
+
     fn accessible(&self, graph: &Graph, r: ObjectRef) -> Result<Vec<u8>, Rejection> {
         Ok(graph.fetch(&self.roots, r)?)
     }
 
     fn apply(&mut self, graph: &mut Graph, action: Action) -> Result<Outcome, Rejection> {
         graph.fetch(&[self.task_ref], self.task_ref)?;
+        let applied = Box::new(action.clone());
         match (&action, self.role) {
             (Action::ReviewClaim { .. }, Role::Planner | Role::Worker)
             | (
@@ -365,27 +534,29 @@ impl Session {
         let mut result = serde_json::json!({});
         let mut done = false;
         let mut fetched_raw_bytes = None;
+        let mut fetched_items = Vec::new();
         match action {
-            Action::Fetch { reference } if self.private.contains_key(&reference) => {
-                // Private repository read: not shared CAS traffic.
-                result = serde_json::json!({"reference":reference,"content_base64":STANDARD.encode(&self.private[&reference])});
-            }
             Action::Fetch { reference } => {
-                if !self.private.is_empty()
-                    && reference.kind == Kind::Artifact
-                    && reference != self.task.instruction
-                    && !self.roots[1..].contains(&reference)
+                let (item, bytes) = self.fetch_item(graph, reference)?;
+                fetched_raw_bytes = bytes;
+                result = item;
+            }
+            Action::FetchMany { references } => {
+                let mut seen = std::collections::BTreeSet::new();
+                if references.is_empty()
+                    || references.len() > MAX_FETCH_MANY
+                    || !references.iter().all(|r| seen.insert(*r))
                 {
-                    return Err(invalid("a source pass reads only its private view").into());
+                    return Err(invalid("fetch_many requires 1 to 16 distinct references").into());
                 }
-                let bytes = self.accessible(graph, reference)?;
-                fetched_raw_bytes = Some(bytes.len() as u64);
-                result = if matches!(reference.kind, Kind::Artifact | Kind::Goal) {
-                    serde_json::json!({"reference":reference,"content_base64":STANDARD.encode(bytes)})
-                } else {
-                    let object = myr_wire::decode(&bytes)?;
-                    serde_json::json!({"reference":reference,"object":object})
-                };
+                // All-or-nothing: an unauthorized item rejects the whole action.
+                let mut items = Vec::new();
+                for reference in references {
+                    let (item, bytes) = self.fetch_item(graph, reference)?;
+                    items.push(item);
+                    fetched_items.push(bytes);
+                }
+                result = serde_json::json!({ "items": items });
             }
             Action::PutArtifact { content_base64 } => {
                 let bytes = STANDARD
@@ -592,7 +763,9 @@ impl Session {
         }
         self.roots.extend(objects.iter().copied());
         Ok(Outcome::Applied {
+            action: applied,
             fetched_raw_bytes,
+            fetched_items,
             objects,
             result,
             done,

@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let outcome = match transport::complete(&config, &request) {
             Ok(completion) => serde_json::json!({"ok":true,
                 "action":serde_json::from_slice::<serde_json::Value>(&completion.raw_output)
-                    .map(|v| v["action"]["tool"].clone()).unwrap_or_default(),
+                    .map(|v| v["actions"].clone()).unwrap_or_default(),
                 "usage":completion.usage}),
             Err(error) => serde_json::json!({"ok":false,"error":error.to_string()}),
         };

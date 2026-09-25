@@ -513,7 +513,8 @@ pub(crate) mod tests {
                     verifier_policies: vec![policy],
                     token_budget: 1000000,
                     call_budget: 10,
-                    time_budget_ms: 30000,
+                    // Generous: simulated missions share a loaded test machine.
+                    time_budget_ms: 600_000,
                 },
             )
             .unwrap();

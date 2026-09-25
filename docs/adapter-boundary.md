@@ -18,9 +18,16 @@ protected paths. A model cannot supply agent identity, lineage, EVIDENCE, FACT,
 ATTEST, scope, or task identity.
 
 Planner/worker actions: `emit_claim`, `emit_assumption`, `emit_delta`, `emit_fail`.
-Reviewer action: `review_claim`. Shared runtime actions: `fetch`, `put_artifact`,
-`finish`. Artifact bodies cross the JSON boundary as canonical Base64 so line
-endings and arbitrary bytes remain opaque. `emit_delta` requires `path`,
+A response is `{"actions":[...]}` with 1 to 8 actions applied in order. A
+reference with `cid` `@k` resolves to the unique object of that kind created by
+action `k` of the same response. `finish` must be last. If an action is
+rejected, the earlier ones stay applied and the response counts as one repair
+or failure. Reviewer action: `review_claim`. Shared runtime actions: `fetch`, `fetch_many`
+(1–16 distinct references, all-or-nothing authorization), `put_artifact`,
+`finish`. Artifact bodies sent by the model cross the JSON boundary as canonical
+Base64, so line endings and arbitrary bytes remain opaque. Fetched artifacts
+come back as `content_text` when the bytes are valid UTF-8 without NUL, and as
+`content_base64` otherwise. `emit_delta` requires `path`,
 `base_ref`, `patch_ref`, `result_ref`, `codec`, and `assumptions`. The codec is
 `REPLACEMENT` or `UNIFIED_DIFF`; replacement requires identical patch and result
 references. Both artifacts must be accessible to the session. Emission records

@@ -8,7 +8,6 @@ use crate::{
     mission::Mission,
     planner::{Catalog, Step},
 };
-use base64::{Engine, engine::general_purpose::STANDARD};
 use myr_adapter::{
     config::ProviderConfig,
     transport::{self, Completion, Request},
@@ -248,10 +247,42 @@ pub(crate) fn run_with(
                     serde_json::json!({"created":reference}).to_string(),
                 ));
             }
+            Ok(Step::FetchedMany(items)) => {
+                for (reference, bytes) in items {
+                    dispatcher.record_cas_read(bytes.len() as u64)?;
+                    let (kind, value) = if reference.kind == Kind::Artifact {
+                        (
+                            dispatcher.classify_artifact(
+                                "planner",
+                                reference,
+                                &repository,
+                                SegmentKind::CasReferenced,
+                            ),
+                            myr_adapter::render_artifact(reference, &bytes).to_string(),
+                        )
+                    } else {
+                        (
+                            SegmentKind::MwRender,
+                            myr_wire::render(&graph.get(reference).map_err(crate::Error::from)?)
+                                .map_err(crate::Error::from)?,
+                        )
+                    };
+                    cas_segments.push(history.len());
+                    history.push((kind, value));
+                }
+            }
             Ok(Step::Fetched { reference, bytes }) => {
                 dispatcher.record_cas_read(bytes.len() as u64)?;
                 let (kind, value) = if reference.kind == Kind::Artifact {
-                    (dispatcher.classify_artifact("planner", reference, &repository, SegmentKind::CasReferenced), serde_json::json!({"reference":reference,"content_base64":STANDARD.encode(bytes)}).to_string())
+                    (
+                        dispatcher.classify_artifact(
+                            "planner",
+                            reference,
+                            &repository,
+                            SegmentKind::CasReferenced,
+                        ),
+                        myr_adapter::render_artifact(reference, &bytes).to_string(),
+                    )
                 } else {
                     (
                         SegmentKind::MwRender,
@@ -354,13 +385,14 @@ mod tests {
             match calls {
                 1 => reply(serde_json::json!({"action":{"tool":"fetch","arguments":{"reference":file}}})),
                 2 => {
-                    assert!(request.prompt.contains(&STANDARD.encode(b"baseline")));
+                    assert!(request.prompt.contains(r#""content_text":"baseline""#));
                     reply(serde_json::json!({"action":{"tool":"define_atom","arguments":{"predicate_ref":sealed.ir().registry[0],
                         "arguments":[{"type":"ref","value":f.policy}]}}}))
                 }
                 3 => {
                     assert!(request.prompt.contains(&f.atom.cid.to_string()));
-                    assert!(request.schema.to_string().contains(&f.atom.cid.to_string()));
+                    // The schema no longer enumerates catalog CIDs (cost pilot B).
+                    assert!(!request.schema.to_string().contains(&f.atom.cid.to_string()));
                     reply(serde_json::json!({"action":{"tool":"submit_goal","arguments":sealed.ir()}}))
                 }
                 _ => panic!("unexpected request"),

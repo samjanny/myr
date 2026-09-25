@@ -89,9 +89,20 @@ impl Fixture {
     }
 }
 fn handle(session: &mut Session, graph: &mut Graph, action: Action) -> Outcome {
-    session
-        .handle(graph, &serde_json::to_vec(&Response { action }).unwrap())
-        .unwrap()
+    last(
+        session
+            .handle(
+                graph,
+                &serde_json::to_vec(&Response {
+                    actions: vec![action],
+                })
+                .unwrap(),
+            )
+            .unwrap(),
+    )
+}
+fn last(mut outcomes: Vec<Outcome>) -> Outcome {
+    outcomes.pop().expect("at least one outcome")
 }
 fn produced(outcome: Outcome) -> Vec<ObjectRef> {
     let Outcome::Applied { objects, .. } = outcome else {
@@ -123,13 +134,13 @@ fn distinct_provider_identities_produce_same_claim_and_different_attestations() 
 fn three_invalid_outputs_are_quarantined_then_runtime_emits_fail() {
     let mut f = Fixture::new();
     let mut session = f.session(Role::Worker, "fixture");
-    let raw = br#"{"action":{"tool":"emit_evidence","arguments":{"confidence":1000000}}}"#;
+    let raw = br#"{"actions":[{"tool":"emit_evidence","arguments":{"confidence":1000000}}]}"#;
     for attempt in 1..=2 {
         assert!(
-            matches!(session.handle(&mut f.graph,raw).unwrap(),Outcome::Repair {attempt:a,..} if a==attempt)
+            matches!(last(session.handle(&mut f.graph,raw).unwrap()),Outcome::Repair {attempt:a,..} if a==attempt)
         );
     }
-    let Outcome::Failed { failure } = session.handle(&mut f.graph, raw).unwrap() else {
+    let Outcome::Failed { failure } = last(session.handle(&mut f.graph, raw).unwrap()) else {
         panic!()
     };
     let Object::Fail(fail) = f.graph.get(failure).unwrap() else {
@@ -168,7 +179,7 @@ fn semantic_failure_rolls_back_entire_atom_claim_attestation_batch() {
     let valid = f.claim_action();
     assert_eq!(produced(handle(&mut s, &mut f.graph, valid)).len(), 3);
     assert!(matches!(
-        s.handle(&mut f.graph, b"not json").unwrap(),
+        last(s.handle(&mut f.graph, b"not json").unwrap()),
         Outcome::Repair { attempt: 1, .. }
     ));
 }
@@ -314,13 +325,15 @@ fn unknown_fields_and_untrusted_lineage_are_rejected_by_schema() {
     let mut f = Fixture::new();
     let mut s = f.session(Role::Worker, "fixture");
     let mut value = serde_json::to_value(Response {
-        action: f.claim_action(),
+        actions: vec![f.claim_action()],
     })
     .unwrap();
-    value["action"]["arguments"]["lineage"] = serde_json::json!({"provider_id":"forged"});
+    value["actions"][0]["arguments"]["lineage"] = serde_json::json!({"provider_id":"forged"});
     assert!(matches!(
-        s.handle(&mut f.graph, &serde_json::to_vec(&value).unwrap())
-            .unwrap(),
+        last(
+            s.handle(&mut f.graph, &serde_json::to_vec(&value).unwrap())
+                .unwrap()
+        ),
         Outcome::Repair { .. }
     ));
     let worker_schema = myr_adapter::schema::response_schema(Role::Worker).to_string();
@@ -434,4 +447,77 @@ fn reviewer_output_is_wrapped_by_runtime_and_two_lineages_promote() {
         panic!()
     };
     assert_eq!(fact.confidence_ppm, 800000);
+}
+
+#[test]
+fn multi_action_responses_resolve_placeholders_and_keep_prior_commits() {
+    let mut f = Fixture::new();
+    let mut s = f.session(Role::Worker, "fixture");
+    let raw = |value: serde_json::Value| serde_json::to_vec(&value).unwrap();
+    // put_artifact then an assumption whose rationale is `@0`: one turn.
+    let outcomes = s
+        .handle(
+            &mut f.graph,
+            &raw(serde_json::json!({"actions":[
+                {"tool":"put_artifact","arguments":{"content_base64":"eA=="}},
+                {"tool":"emit_assumption","arguments":{"question":"Which variant?","chosen":"A",
+                    "alternatives":["B"],"rationale_ref":{"kind":"ARTIFACT","cid":"@0"},"artifacts":[]}}
+            ]})),
+        )
+        .unwrap();
+    assert_eq!(outcomes.len(), 2);
+    let artifact = produced(outcomes.into_iter().next().unwrap())[0];
+    assert_eq!(artifact.cid, myr_wire::artifact_cid(b"x"));
+    // finish must be last: nothing in the response is applied.
+    let outcomes = s
+        .handle(
+            &mut f.graph,
+            &raw(serde_json::json!({"actions":[
+                {"tool":"finish","arguments":{}},
+                {"tool":"put_artifact","arguments":{"content_base64":"eQ=="}}
+            ]})),
+        )
+        .unwrap();
+    assert!(
+        matches!(&outcomes[..], [Outcome::Repair { message, .. }] if message.starts_with("action 0"))
+    );
+    assert!(
+        !f.graph
+            .cas()
+            .exists(ObjectRef::new(Kind::Artifact, myr_wire::artifact_cid(b"y")))
+            .unwrap()
+    );
+    // A rejected later action keeps the earlier commit and reports its index.
+    let outcomes = s
+        .handle(
+            &mut f.graph,
+            &raw(serde_json::json!({"actions":[
+                {"tool":"put_artifact","arguments":{"content_base64":"eg=="}},
+                {"tool":"emit_assumption","arguments":{"question":"Q","chosen":"A","alternatives":["B"],
+                    "rationale_ref":{"kind":"ARTIFACT","cid":"@1"},"artifacts":[]}}
+            ]})),
+        )
+        .unwrap();
+    assert!(matches!(&outcomes[0], Outcome::Applied { .. }));
+    assert!(
+        matches!(&outcomes[1], Outcome::Repair { message, .. } if message.starts_with("action 1"))
+    );
+    let z = ObjectRef::new(Kind::Artifact, myr_wire::artifact_cid(b"z"));
+    assert_eq!(s.committed(), &[z]);
+    assert!(f.graph.live(z).unwrap());
+    // More than eight actions, or none, is invalid.
+    let many: Vec<_> = (0..9)
+        .map(|_| serde_json::json!({"tool":"put_artifact","arguments":{"content_base64":"eA=="}}))
+        .collect();
+    // Two repairs were used above; a fresh session checks the size bounds.
+    let mut s = f.session(Role::Worker, "fixture");
+    for actions in [serde_json::json!(many), serde_json::json!([])] {
+        let outcomes = s
+            .handle(
+                &mut f.graph,
+                &raw(serde_json::json!({ "actions": actions })),
+            )
+            .unwrap();
+        assert!(matches!(&outcomes[..], [Outcome::Repair { .. }]));
+    }
 }

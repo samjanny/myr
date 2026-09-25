@@ -70,8 +70,18 @@ action declarations are exempt; a matching tool name is insufficient. The JSON
 envelope is exempt only when identical, and each comma belongs to its following
 action. Concatenating all retained fragments reproduces the compact schema
 exactly. The shared schema is `schema::prose_shared_schema()`, the union of the
-[prose baseline](prose-baseline.md) declarations. Only `fetch`, `put_artifact` and
-`finish` are byte-identical to MW/0 declarations and therefore exempt.
+[prose baseline](prose-baseline.md) declarations. Only `fetch`, `fetch_many`,
+`put_artifact` and `finish` are byte-identical to MW/0 declarations and
+therefore exempt.
+
+Fetched artifacts are rendered by `myr_adapter::render_artifact`, which both
+pipelines share (cost-pilot step A). Bytes that are valid UTF-8 without NUL
+appear as `content_text`, and anything else as `content_base64`. This is a
+rendering choice, not an accounting rule: tokens are counted on exactly the
+inserted representation. A `fetch_many` action (step C) returns the same items,
+with the same authorization, as individual fetches. Each item is its own context
+segment with its own provenance class and CAS-derived flag, and logical CAS
+bytes are recorded per item.
 
 Tests cover known token IDs, literal special-token text, prevention of merges
 across segment boundaries, repeated schemas, pipeline classification, and binary

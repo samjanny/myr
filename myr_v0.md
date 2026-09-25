@@ -242,6 +242,12 @@ A mission ends in one of five states: COMPLETE, COMPLETE_WITH_ASSUMPTIONS, PARTI
 
 UNSAT requires evidence of incompatible obligations; budget exhaustion or tool failures lead to PARTIAL, not UNSAT.
 
+Delivery rule for received claims. Every CLAIM that the worker received from another agent, whose predicate is not HEURISTIC, must be reviewed by both LLM reviewers. A missing review is invalid reviewer output, not an inconclusive verdict.
+
+When the runtime accepts a DELTA from the worker, it adds a `depends_on` edge from that DELTA to every such CLAIM in the worker's inputs that is still unresolved. The model can neither add nor omit these edges. They are conservative: they record that the output was produced while those claims were unresolved inputs, not that the model's reasoning used each of them. Identical DELTA bytes produced by different tasks accumulate the union of their edges.
+
+A candidate is not delivered if its dependency closure contains a non-HEURISTIC CLAIM without an active FACT that has at least one valid contrary EVIDENCE (Appendix B.1). The mission then ends PARTIAL even if every binding obligation is proven. This is a query over the closure computed before delivery. Contrary EVIDENCE does not deactivate a CLAIM, so the candidate is not marked stale automatically. HEURISTIC claims never block delivery, since they can never be binding. A candidate without DELTAs cannot carry a received premise.
+
 ## Benchmark
 
 The benchmark measures whether Myr v0 reduces the propagation of falsehoods between agents without substantially reducing their ability to complete the task.
@@ -312,6 +318,8 @@ Before freezing, every poison passes a filter: it derives from a real, plausible
 ### What the benchmark measures
 
 In Myr, source-agent information arrives marked as an unverified CLAIM; in the baseline it arrives as an ordinary sentence. The asymmetry is intentional: the benchmark measures the value of the epistemic protocol as a whole, not the isolated effect of CLAIM → FACT promotion. Isolating that requires an optional ablation: Myr with structured MW/0 but without the claim/fact filter. The ablation does not enter the success criterion.
+
+Reviewer visibility differs by design. In Myr, both reviewers see every inter-agent CLAIM the worker received, and must review it. In the baseline, a reviewer sees source prose only if it was explicitly addressed to that reviewer, and delivery requires both reviewers' approval. This is not an accidental harness difference: Myr makes inter-agent assertions explicit, addressable and reviewable, while in prose their visibility depends on the message flow. It is part of the protocol under test and does not give Myr additional repository context.
 
 The two reviewers have a cost: in both pipelines each mission has two extra LLM passes, and in Myr two `MW_RENDER` renderings of the same graph. If reviewers contradict one another, LLM-only promotion is blocked: PCR improves and HEURISTIC or UNRESOLVED predicates may lead to PARTIAL. CTSR must record this outcome; it is not a reason to adjust the policy.
 
@@ -410,7 +418,7 @@ Anything not needed to test the thesis's three assertions remains outside v0.
 | AST deltas, JSON patch, binary chunks | Unified diff or full replacement |
 | Correlation-calibrated confidence formula | Threshold promotion rule (Data model section) |
 | Hidden obligations, counterexample agents, mutation testing | Deterministic verifier + two LLM reviewers of different lineages |
-| Speculative execution of hypotheses | Declared, invalidatable assumptions |
+| Speculative execution of hypotheses, including rerunning work invalidated by a contradicted claim | Declared, invalidatable assumptions; runtime premise edges from DELTAs to unresolved received claims, checked before delivery |
 | Custom binary wire format (MW/1) | Canonical CBOR |
 
 ## Work plan
@@ -510,6 +518,8 @@ Second round: minimum primary-condition composition, verified `view_diff`, side-
 Third round: CAS rule in the primary condition (`source_view` blobs cannot be referenced; the source may quote text only in its own objects or artifacts, symmetrically with baseline prose), two LLM reviewers of different lineages instead of only one, EVIDENCE emitted only by the runtime, tool schemas counted symmetrically with a rule fixed before the pilot, frozen `MW_RENDER` rendering, bootstrap over the N admitted primary cases. This also closed the two open points in Appendix C. Fourth round: removed `emit_evidence` and defined `review_claim`, aligned singular-reviewer references, declared the cost of two reviewers. After the fourth round the specification was considered complete: the next step is the repository, not another review.
 
 Revision 1 (Sep 25, 2026), adopted by the owner before any live or official run: the planner is the source agent in two passes, reading `source_view` only after its plan is frozen; runs have a DELIVERED / NO_DELIVERY / UNAVAILABLE disposition; PTSR is a primary guardrail alongside CTSR; Appendix C classifies artifact content by provenance rather than by retrieval channel.
+
+Revision 2 (Sep 25, 2026), adopted by the owner before any official run: a non-HEURISTIC CLAIM received by the worker from another agent must be reviewed by both reviewers. The runtime links every accepted worker DELTA to the unresolved received claims. A candidate whose dependency closure contains such a claim without an active FACT and with valid contrary EVIDENCE is not delivered. Speculative re-execution after a contradiction (invalidating and rerunning affected work) is deferred to post-v0 work, because it turns the fixed pipeline into an iterative system and changes budgets, termination and the baseline. The baseline keeps its reviewer REJECT. The resulting difference in reviewer visibility is declared as a property of the protocol under test.
 
 ## Appendix A — lineage-v0
 

@@ -274,10 +274,10 @@ mod tests {
         assert_eq!(ledger.totals().cas_context_bytes, 6);
         let schema = myr_adapter::schema::response_schema(myr_adapter::Role::Worker);
         let mut shared = schema.clone();
-        shared["properties"]["action"]["anyOf"]
+        shared["properties"]["actions"]["items"]["anyOf"]
             .as_array_mut()
             .unwrap()
-            .truncate(3);
+            .truncate(4);
         let mut ledger = Ledger::new(Pipeline::Mw0);
         let refs = context
             .record_with_schema(&t, &mut ledger, &audit, "worker", (&schema, &shared))

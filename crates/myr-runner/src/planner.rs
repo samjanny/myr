@@ -11,11 +11,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
-/// Reference sets up to this size are enumerated in the planner schema; larger
-/// sets use the CID pattern so the schema stays bounded for big repositories.
-/// Access control never depends on the schema: the catalog checks every action.
-pub const MAX_ENUMERATED_REFERENCES: usize = 16;
-
 pub struct Catalog {
     registry: BTreeSet<ObjectRef>,
     atoms: BTreeSet<ObjectRef>,
@@ -41,6 +36,8 @@ enum Action {
     PutRationale { text: String },
     #[serde(rename = "fetch")]
     Fetch { reference: ObjectRef },
+    #[serde(rename = "fetch_many")]
+    FetchMany { references: Vec<ObjectRef> },
 }
 
 pub enum Step {
@@ -49,6 +46,8 @@ pub enum Step {
         reference: ObjectRef,
         bytes: Vec<u8>,
     },
+    /// Same items and authorization as individual fetches, in request order.
+    FetchedMany(Vec<(ObjectRef, Vec<u8>)>),
     Sealed(Box<SealedGoal>),
 }
 
@@ -72,13 +71,14 @@ fn record(properties: Value) -> Value {
         .collect();
     json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
 }
-fn references(kind: Kind, allowed: &BTreeSet<ObjectRef>) -> Value {
-    let cid = if allowed.is_empty() || allowed.len() > MAX_ENUMERATED_REFERENCES {
-        json!({"type":"string","pattern":"^b3:[0-9a-f]{64}$"})
-    } else {
-        json!({"type":"string","enum":allowed.iter().map(|r| r.cid.to_string()).collect::<Vec<_>>()})
-    };
-    record(json!({"kind":{"type":"string","enum":[kind]},"cid":cid}))
+/// The schema constrains each reference's kind and CID syntax only. Listing
+/// catalog CIDs made them about two thirds of the schema, re-sent on every
+/// call (cost pilot, step B); the catalog rendering already lists them.
+/// Access control never depends on the schema: the catalog checks every action.
+fn references(kind: Kind) -> Value {
+    record(
+        json!({"kind":{"type":"string","enum":[kind]},"cid":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"}}),
+    )
 }
 fn list(items: Value, empty_only: bool) -> Value {
     let mut value = json!({"type":"array","items":items});
@@ -188,6 +188,24 @@ impl Catalog {
                     bytes: graph.cas().get(reference)?,
                 })
             }
+            Action::FetchMany { references } => {
+                let mut seen = BTreeSet::new();
+                if references.is_empty()
+                    || references.len() > myr_adapter::MAX_FETCH_MANY
+                    || !references.iter().all(|r| seen.insert(*r))
+                {
+                    return Err(invalid("fetch_many requires 1 to 16 distinct references").into());
+                }
+                if !references.iter().all(|r| self.contains(*r)) {
+                    return Err(invalid("planner fetch is outside its catalog").into());
+                }
+                Ok(Step::FetchedMany(
+                    references
+                        .into_iter()
+                        .map(|r| Ok((r, graph.cas().get(r)?)))
+                        .collect::<Result<_>>()?,
+                ))
+            }
             Action::Submit(ir) => Ok(Step::Sealed(Box::new(self.compile_ir(
                 graph,
                 mission,
@@ -231,6 +249,7 @@ impl Catalog {
     pub(crate) fn access_allowed(&self, raw: &[u8]) -> Result<bool> {
         Ok(match decode(raw)? {
             Action::Fetch { reference } => self.contains(reference),
+            Action::FetchMany { references } => references.iter().all(|r| self.contains(*r)),
             Action::DefineAtom {
                 predicate_ref,
                 arguments,
@@ -263,8 +282,8 @@ impl Catalog {
     /// Compatible action envelope for the four existing transports and schema
     /// accounting. This contract does not add an agent API for FACT or EVIDENCE.
     pub fn response_schema(&self, mission: &Mission) -> Value {
-        let atom = references(Kind::Atom, &self.atoms);
-        let artifact = references(Kind::Artifact, &self.artifacts);
+        let atom = references(Kind::Atom);
+        let artifact = references(Kind::Artifact);
         let measurement = if self.artifacts.is_empty() {
             json!({"type":"null"})
         } else {
@@ -280,11 +299,11 @@ impl Catalog {
             "artifacts":list(artifact.clone(),self.artifacts.is_empty())}),
         );
         let ir = record(json!({"goal":{"type":"string","enum":[mission.goal]},
-            "registry":list(references(Kind::PredicateDef,&self.registry),false),
+            "registry":list(references(Kind::PredicateDef),false),
             "criteria":list(criterion,self.atoms.is_empty()),"assumptions":list(assumption,self.artifacts.is_empty() || self.atoms.is_empty())}));
         let action =
             record(json!({"tool":{"type":"string","enum":["submit_goal"]},"arguments":ir}));
-        let mut ref_variants = vec![references(Kind::PredicateDef, &self.registry)];
+        let mut ref_variants = vec![references(Kind::PredicateDef)];
         if !self.atoms.is_empty() {
             ref_variants.push(atom);
         }
@@ -306,14 +325,17 @@ impl Catalog {
         .map(|(tag, value)| record(json!({"type":{"type":"string","enum":[tag]},"value":value})))
         .collect();
         let define = record(json!({"tool":{"type":"string","enum":["define_atom"]},
-            "arguments":record(json!({"predicate_ref":references(Kind::PredicateDef,&self.registry),"arguments":list(json!({"anyOf":argument_variants}),false)}))}));
+            "arguments":record(json!({"predicate_ref":references(Kind::PredicateDef),"arguments":list(json!({"anyOf":argument_variants}),false)}))}));
         let rationale = record(
             json!({"tool":{"type":"string","enum":["put_rationale"]},"arguments":record(json!({"text":{"type":"string"}}))}),
+        );
+        let fetch_many = record(
+            json!({"tool":{"type":"string","enum":["fetch_many"]},"arguments":record(json!({"references":list(reference.clone(),false)}))}),
         );
         let fetch = record(
             json!({"tool":{"type":"string","enum":["fetch"]},"arguments":record(json!({"reference":reference}))}),
         );
-        record(json!({"action":{"anyOf":[action,define,rationale,fetch]}}))
+        record(json!({"action":{"anyOf":[action,define,rationale,fetch,fetch_many]}}))
     }
 
     /// Read and validate untrusted bytes before the compiler writes a goal seal.
@@ -352,7 +374,7 @@ mod tests {
     use crate::{goal, mission::Mission};
 
     #[test]
-    fn large_catalogs_keep_the_planner_schema_bounded() {
+    fn planner_schema_lists_no_catalog_cids_and_does_not_grow_with_the_catalog() {
         let mut f = crate::command_verification::tests::Fixture::new(true);
         let sealed = goal::load(&f.graph, f.goal).unwrap();
         let mission = Mission {
@@ -361,28 +383,10 @@ mod tests {
             protected: vec![],
         };
         let mut artifacts = vec![f.policy];
-        for index in 0..MAX_ENUMERATED_REFERENCES {
-            artifacts.push(
-                f.graph
-                    .register_artifact(format!("file {index}").as_bytes())
-                    .unwrap(),
-            );
-        }
-        let small = Catalog::new(
-            &f.graph,
-            &sealed.ir().registry,
-            &[f.atom],
-            &artifacts[..MAX_ENUMERATED_REFERENCES],
-        )
-        .unwrap();
-        let enumerated = small.response_schema(&mission).to_string();
-        assert!(enumerated.contains(&f.policy.cid.to_string()));
-        let large = Catalog::new(&f.graph, &sealed.ir().registry, &[f.atom], &artifacts).unwrap();
-        let bounded = large.response_schema(&mission).to_string();
-        assert!(!bounded.contains(&artifacts[1].cid.to_string()));
-        assert!(bounded.contains(&f.atom.cid.to_string()));
-        // Claude Code passes the schema on the command line; keep it well below
-        // that transport's documented limit even for repositories with many files.
+        let small = Catalog::new(&f.graph, &sealed.ir().registry, &[f.atom], &artifacts)
+            .unwrap()
+            .response_schema(&mission)
+            .to_string();
         for index in 0..2000 {
             artifacts.push(
                 f.graph
@@ -390,7 +394,16 @@ mod tests {
                     .unwrap(),
             );
         }
-        let huge = Catalog::new(&f.graph, &sealed.ir().registry, &[f.atom], &artifacts).unwrap();
-        assert!(huge.response_schema(&mission).to_string().len() < 8000);
+        let huge = Catalog::new(&f.graph, &sealed.ir().registry, &[f.atom], &artifacts)
+            .unwrap()
+            .response_schema(&mission)
+            .to_string();
+        // Catalog membership is enforced at runtime, not enumerated per call.
+        for reference in [f.policy, f.atom, artifacts[1], sealed.ir().registry[0]] {
+            assert!(!small.contains(&reference.cid.to_string()));
+        }
+        assert_eq!(small, huge);
+        // Claude Code passes the schema on the command line.
+        assert!(huge.len() < 8000);
     }
 }
