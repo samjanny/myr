@@ -18,6 +18,9 @@ protected paths. A model cannot supply agent identity, lineage, EVIDENCE, FACT,
 ATTEST, scope, or task identity.
 
 Planner/worker actions: `emit_claim`, `emit_assumption`, `emit_delta`, `emit_fail`.
+References shown to the model use mission-wide short aliases `#n` (see
+`aliases.rs` and the cost pilot, step B2). The runtime resolves them to full CIDs
+before validation; nothing persistent contains an alias.
 A response is `{"actions":[...]}` with 1 to 8 actions applied in order. A
 reference with `cid` `@k` resolves to the unique object of that kind created by
 action `k` of the same response. `finish` must be last. If an action is

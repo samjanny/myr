@@ -81,6 +81,7 @@ Updated: 2026-09-25. Goal remains active and incomplete.
   | A | 76.1k | 41.5 | 2.6k | about 29 times |
   | C | 50.4k | 20 | 2.0k | about 25 times |
   | C + B1 + C2 | 27.7k | 13 | 0.96k | about 29 times |
+  | C + B1 + C2 + B2 | 19.8k | 13.5 | 0.58k | about 34 times |
 
   The remaining MW/0 cost is mostly per-call schemas (planner about 3k, worker
   about 1.1k) and MW renderings dominated by hexadecimal CIDs.
@@ -90,8 +91,14 @@ Updated: 2026-09-25. Goal remains active and incomplete.
     pipelines) is implemented and measured live: MW/0 went from 20 to 13
     responses. Prose improved proportionally, so the ratio no longer moves; the
     remaining gap is protocol cost. See `docs/cost-pilot.md`.
-  - Step B2 (short textual CIDs) awaits an owner decision.
-- The offline suite passes **178 tests on Linux** (Rust 1.95.0) with Clippy
+  - Step B2 (mission-wide `#n` aliases in model-facing text, never persisted,
+    resolved before validation, private view unaliased) is implemented in both
+    pipelines and measured live: MW/0 fell 28% and prose 39%. All four runs
+    were COMPLETE.
+  - Next: a second pilot along a scale curve with realistic artifacts, to test
+    whether MW/0's fixed protocol cost amortizes.
+  - Host preflight: `--max-load-per-cpu` and `--min-available-memory-mib`.
+- The offline suite passes **180 tests on Linux** (Rust 1.95.0) with Clippy
   (`-D warnings`) and rustfmt clean.
 - Live Docker confinement acceptance (2026-09-25) passes: the ignored test
   `tests/live_docker.rs` ran against local image `caddy:2-alpine` with Docker

@@ -107,6 +107,12 @@ Benchmark options, valid for both pipelines:
   configured in the provider account is outside Myr's control and must be
   disabled there.
 
+- `--max-load-per-cpu <f>` and `--min-available-memory-mib <n>`: host
+  preflight on Linux. If the 1-minute load average per CPU exceeds the limit,
+  or available memory is below it, the run does not start. No store is created
+  and no provider is called; a harness records this as infrastructure
+  unavailability.
+
 Each executed result includes `run_disposition` (DELIVERED, NO_DELIVERY or
 UNAVAILABLE with a reason); see [benchmark collection](benchmark-collection.md).
 

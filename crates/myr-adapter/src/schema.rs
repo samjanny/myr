@@ -106,7 +106,7 @@ fn reference(kind: Option<&str>) -> Value {
         ])
     });
     record(
-        json!({"kind":{"type":"string","enum":kinds},"cid":{"type":"string","pattern":"^(b3:[0-9a-f]{64}|@[0-7])$"}}),
+        json!({"kind":{"type":"string","enum":kinds},"cid":{"type":"string","pattern":"^(b3:[0-9a-f]{64}|@[0-7]|#[1-9][0-9]*)$"}}),
     )
 }
 /// Multi-action response envelope shared by both pipelines (step C2). The

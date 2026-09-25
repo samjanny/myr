@@ -914,3 +914,56 @@ fn subscription_only_rejects_api_backends_before_creating_a_store() {
     // Without the guard the same explicit API selection is still allowed.
     assert!(run(false).status.success());
 }
+
+#[test]
+fn host_preflight_refuses_to_start_on_an_overloaded_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repository");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::write(repo.join("file.bin"), b"x").unwrap();
+    let mission = dir.path().join("myr.yaml");
+    std::fs::write(&mission, "goal: Preserve behavior\nverify: [cargo test]\n").unwrap();
+    let config = dir.path().join("runtime.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&runtime_config(dir.path())).unwrap(),
+    )
+    .unwrap();
+    let root = dir.path().join("store");
+    let run = |args: &[&str]| {
+        myr()
+            .arg("run")
+            .arg(&mission)
+            .arg("--config")
+            .arg(&config)
+            .arg("--repository")
+            .arg(&repo)
+            .arg("--root")
+            .arg(&root)
+            .arg("--prepare-only")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    // Impossible thresholds: nothing is created and nothing is called.
+    for args in [
+        &["--max-load-per-cpu=-1"][..],
+        &["--min-available-memory-mib=18446744073709551615"][..],
+    ] {
+        let output = run(args);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("host unavailable"));
+        assert!(!root.exists());
+    }
+    // Generous thresholds let preparation proceed.
+    assert!(
+        run(&[
+            "--max-load-per-cpu",
+            "1000",
+            "--min-available-memory-mib",
+            "1"
+        ])
+        .status
+        .success()
+    );
+}

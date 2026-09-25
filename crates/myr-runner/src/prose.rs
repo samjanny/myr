@@ -458,7 +458,13 @@ impl<D: Driver> Pipeline<'_, D> {
             match if completion.raw_output.len() > MAX_RESPONSE_BYTES {
                 Err("response exceeds size limit".to_string())
             } else {
-                myr_adapter::response_actions(&completion.raw_output)
+                // Resolve short references (step B2) before any validation.
+                myr_adapter::response_actions(
+                    &self
+                        .dispatcher
+                        .aliases()
+                        .resolve_raw(&completion.raw_output),
+                )
             } {
                 Err(message) => rejected = Some(Rejection::Invalid(message)),
                 Ok(actions) => {
@@ -532,6 +538,7 @@ impl<D: Driver> Pipeline<'_, D> {
                         Rejection::Invalid(message) => (message, false),
                         Rejection::Policy(message) => (message, true),
                     };
+                    let message = self.dispatcher.aliases_mut().view_text(&message);
                     repairs += 1;
                     if policy || repairs > 2 {
                         let code = if policy {
@@ -555,7 +562,7 @@ impl<D: Driver> Pipeline<'_, D> {
 
     /// Render one authorized read, classified by provenance.
     fn read(
-        &self,
+        &mut self,
         input: &StageInput<'_>,
         reference: ObjectRef,
     ) -> Result<(SegmentKind, serde_json::Value)> {
@@ -565,7 +572,8 @@ impl<D: Driver> Pipeline<'_, D> {
             &input.repository,
             SegmentKind::InterAgentArtifact,
         );
-        let bytes = match input.private.and_then(|p| p.files.get(&reference)) {
+        let private = input.private.and_then(|p| p.files.get(&reference));
+        let bytes = match private {
             Some(bytes) => bytes.clone(),
             None => self
                 .graph
@@ -573,7 +581,13 @@ impl<D: Driver> Pipeline<'_, D> {
                 .get(reference)
                 .map_err(crate::Error::from)?,
         };
-        Ok((kind, myr_adapter::render_artifact(reference, &bytes)))
+        let mut value = myr_adapter::render_artifact(reference, &bytes);
+        // Private source-view reads stay unaliased (no hint about which files
+        // differ); repository and agent content is never rewritten.
+        if private.is_none() {
+            self.dispatcher.aliases_mut().view(&mut value, false);
+        }
+        Ok((kind, value))
     }
 
     /// `Ok(Ok(None))` is finish; `Ok(Ok(Some(..)))` is a receipt and its class.
@@ -642,10 +656,11 @@ impl<D: Driver> Pipeline<'_, D> {
                 if !stage.artifacts.contains(&reference) {
                     stage.artifacts.push(reference);
                 }
-                Ok(Ok(Some(vec![(
-                    SegmentKind::LocalTool,
-                    serde_json::json!({"objects":[reference],"result":{}}),
-                )])))
+                Ok(Ok(Some(vec![(SegmentKind::LocalTool, {
+                    let mut receipt = serde_json::json!({"objects":[reference],"result":{}});
+                    self.dispatcher.aliases_mut().view(&mut receipt, false);
+                    receipt
+                })])))
             }
             Action::Finish {} => Ok(Ok(None)),
             Action::SendMessage { to, text } => {
@@ -691,10 +706,11 @@ impl<D: Driver> Pipeline<'_, D> {
                     return invalid("content_ref must be an own artifact or repository file");
                 }
                 stage.writes.insert(path.clone(), content_ref);
-                Ok(Ok(Some(vec![(
-                    SegmentKind::LocalTool,
-                    serde_json::json!({"objects":[],"result":{"path":path,"content_ref":content_ref}}),
-                )])))
+                Ok(Ok(Some(vec![(SegmentKind::LocalTool, {
+                    let mut receipt = serde_json::json!({"objects":[],"result":{"path":path,"content_ref":content_ref}});
+                    self.dispatcher.aliases_mut().view(&mut receipt, false);
+                    receipt
+                })])))
             }
             Action::SubmitReview { verdict, message } if role == Role::Reviewer => {
                 if stage.review.is_some() {
@@ -785,7 +801,7 @@ fn run_with(
     let deadline = dispatcher.deadline();
     let remaining = || deadline.saturating_duration_since(Instant::now());
     let goal_text = serde_json::to_string(mission).map_err(crate::Error::from)?;
-    let repository = serde_json::json!({"repository":baseline}).to_string();
+    let repository = serde_json::json!({ "repository": baseline });
     let mut pipeline = Pipeline {
         graph,
         dispatcher,
@@ -854,7 +870,9 @@ fn run_with(
                 )
             }
             None => {
-                segments.push((SegmentKind::DirectRepo, repository.clone()));
+                let mut listing = repository.clone();
+                pipeline.dispatcher.aliases_mut().view(&mut listing, false);
+                segments.push((SegmentKind::DirectRepo, listing.to_string()));
                 (baseline_files.clone(), BTreeSet::new())
             }
         };
@@ -973,9 +991,13 @@ fn run_with(
     // The baseline listing is initial repository content. The candidate listing
     // describes the worker's output, like the MW/0 candidate manifest, and is
     // therefore inter-agent content by provenance.
-    let base_listing = serde_json::json!({ "baseline": baseline }).to_string();
-    let candidate_listing =
-        serde_json::json!({"candidate":manifest.files,"changed":changed}).to_string();
+    let mut base_listing = serde_json::json!({ "baseline": baseline });
+    let mut candidate_listing = serde_json::json!({"candidate":manifest.files,"changed":changed});
+    let aliases = pipeline.dispatcher.aliases_mut();
+    aliases.view(&mut base_listing, false);
+    aliases.view(&mut candidate_listing, false);
+    let (base_listing, candidate_listing) =
+        (base_listing.to_string(), candidate_listing.to_string());
     let mut readable = baseline_files.clone();
     readable.extend(manifest.files.values().copied());
     for slot in [RoleSlot::ReviewerA, RoleSlot::ReviewerB] {
@@ -1236,6 +1258,18 @@ mod tests {
         }
     }
 
+    /// The exact prompt segment (with its two-LF separator) starting with
+    /// `prefix`, as the model saw it.
+    fn segment(prompt: &str, prefix: &str) -> String {
+        let found = prompt
+            .split("\n\n")
+            .find(|s| s.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no segment starting with {prefix}"));
+        // Short references (step B2): no full CID reaches the model here.
+        assert!(!found.contains("b3:"), "{found}");
+        format!("{found}\n\n")
+    }
+
     fn reference(bytes: &[u8]) -> Value {
         serde_json::to_value(ObjectRef::new(
             Kind::Artifact,
@@ -1355,13 +1389,12 @@ mod tests {
         // candidate listing derived from the worker's output (5 reviewer calls)
         // and the worker-authored file reviewer A read (its last 2 calls). The
         // planner's read of an unchanged repository file is not communication.
-        let listing = format!(
-            "{}\n\n",
-            json!({"candidate":manifest.files,"changed":["f"]})
-        );
-        let receipt = format!(
-            "{}\n\n",
-            json!({"objects":[],"result":myr_adapter::render_artifact(serde_json::from_value(reference(b"new")).unwrap(), b"new")})
+        let _ = &manifest;
+        let reviewer = driver.prompts(RoleSlot::ReviewerA);
+        let listing = segment(reviewer[0], r#"{"candidate":"#);
+        let receipt = segment(
+            reviewer.last().unwrap(),
+            r#"{"objects":[],"result":{"content_text":"new""#,
         );
         let tokenizer = ReferenceTokenizer::new().unwrap();
         let expected = 7 * tokenizer.count(planner)
@@ -1407,21 +1440,12 @@ mod tests {
         let manifest = candidate::load_manifest(&f.graph, report.candidate.unwrap()).unwrap();
         let planner = "Message from planner:\nReplace f with new.\n\n";
         let worker = "Message from worker:\nf now contains new.\n\n";
-        let listing = format!(
-            "{}\n\n",
-            json!({"candidate":manifest.files,"changed":["f"]})
-        );
-        let item = |bytes: &[u8]| {
-            format!(
-                "{}\n\n",
-                myr_adapter::render_artifact(
-                    serde_json::from_value(reference(bytes)).unwrap(),
-                    bytes
-                )
-            )
-        };
-        for prompt in &driver.prompts(RoleSlot::ReviewerA)[1..] {
-            assert!(prompt.contains(&item(b"new")) && prompt.contains(&item(b"protected")));
+        let _ = &manifest;
+        let reviewer = driver.prompts(RoleSlot::ReviewerA);
+        let listing = segment(reviewer[0], r#"{"candidate":"#);
+        let item = |bytes: &str| segment(reviewer[1], &format!(r#"{{"content_text":"{bytes}""#));
+        for prompt in &reviewer[1..] {
+            assert!(prompt.contains(&item("new")) && prompt.contains(&item("protected")));
         }
         // The worker-authored file counts; the unchanged repository file does not.
         let tokenizer = ReferenceTokenizer::new().unwrap();
@@ -1430,7 +1454,7 @@ mod tests {
             7 * tokenizer.count(planner)
                 + 2 * tokenizer.count(worker)
                 + 5 * tokenizer.count(&listing)
-                + 2 * tokenizer.count(&item(b"new"))
+                + 2 * tokenizer.count(&item("new"))
         );
     }
 

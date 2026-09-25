@@ -59,6 +59,12 @@ enum Command {
         /// Refuse any separately billed API backend before creating the store.
         #[arg(long)]
         subscription_only: bool,
+        /// Do not start when the 1-minute load average per CPU exceeds this.
+        #[arg(long)]
+        max_load_per_cpu: Option<f64>,
+        /// Do not start when available memory is below this many MiB.
+        #[arg(long)]
+        min_available_memory_mib: Option<u64>,
     },
     /// Import a repository baseline into a new store without invoking agents.
     Snapshot {
@@ -156,7 +162,12 @@ fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             pipeline,
             source_view,
             subscription_only,
+            max_load_per_cpu,
+            min_available_memory_mib,
         } => 'run: {
+            // Host preflight: an overloaded machine makes sandbox and provider
+            // timeouts likely, so the run does not start (no store, no calls).
+            host_preflight(max_load_per_cpu, min_available_memory_mib)?;
             if root.exists() {
                 return Err("run output store must be a new directory".into());
             }
@@ -365,6 +376,44 @@ fn execute(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         return Err(
             "mission did not complete; see result.json and the recorded failure references".into(),
         );
+    }
+    Ok(())
+}
+
+fn host_preflight(
+    max_load_per_cpu: Option<f64>,
+    min_available_memory_mib: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(limit) = max_load_per_cpu {
+        let load: f64 = std::fs::read_to_string("/proc/loadavg")?
+            .split_whitespace()
+            .next()
+            .ok_or("unreadable /proc/loadavg")?
+            .parse()?;
+        let cpus = std::thread::available_parallelism()?.get() as f64;
+        if load / cpus > limit {
+            return Err(format!(
+                "host unavailable: load per CPU {:.2} exceeds {limit}; run not started",
+                load / cpus
+            )
+            .into());
+        }
+    }
+    if let Some(minimum) = min_available_memory_mib {
+        let meminfo = std::fs::read_to_string("/proc/meminfo")?;
+        let available_kib: u64 = meminfo
+            .lines()
+            .find_map(|l| l.strip_prefix("MemAvailable:"))
+            .and_then(|v| v.split_whitespace().next())
+            .ok_or("unreadable MemAvailable")?
+            .parse()?;
+        if available_kib / 1024 < minimum {
+            return Err(format!(
+                "host unavailable: {} MiB available, below {minimum}; run not started",
+                available_kib / 1024
+            )
+            .into());
+        }
     }
     Ok(())
 }

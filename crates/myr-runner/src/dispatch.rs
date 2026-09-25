@@ -76,6 +76,9 @@ pub struct Dispatcher {
     audit_failed: bool,
     /// First agent that authored each artifact in this mission (Appendix C.1).
     artifact_origins: BTreeMap<ObjectRef, String>,
+    /// Mission-wide model-facing short references (step B2). A view only:
+    /// journaled privately for audit, never written to shared state.
+    aliases: myr_adapter::aliases::Aliases,
 }
 
 impl Dispatcher {
@@ -104,6 +107,7 @@ impl Dispatcher {
             checkpoint_sequence: 0,
             audit_failed: false,
             artifact_origins: BTreeMap::new(),
+            aliases: Default::default(),
         })
     }
     pub fn journal_directory(&self) -> &Path {
@@ -120,6 +124,7 @@ impl Dispatcher {
                 "previous":self.checkpoint, "pending":self.pending, "attempts":self.attempts,
                 "budget":self.budget.ledger(), "accounting":self.accounting,
                 "artifact_origins":self.artifact_origins.iter().collect::<Vec<_>>(),
+                "aliases":self.aliases.table(),
             }))?;
             let reference = self.audit.put_artifact(&bytes)?;
             let mut pointer = tempfile::NamedTempFile::new_in(&self.journal_dir)?;
@@ -162,6 +167,13 @@ impl Dispatcher {
     }
     pub fn attempts(&self) -> &[Attempt] {
         &self.attempts
+    }
+
+    pub fn aliases(&self) -> &myr_adapter::aliases::Aliases {
+        &self.aliases
+    }
+    pub fn aliases_mut(&mut self) -> &mut myr_adapter::aliases::Aliases {
+        &mut self.aliases
     }
 
     /// Record that `agent` authored an artifact. The first author is retained;

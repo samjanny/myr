@@ -200,10 +200,13 @@ pub(crate) fn run_with(
     })
     .map_err(crate::dispatch::Error::Budget)?;
     let tokenizer = ReferenceTokenizer::new()?;
-    let mut history = vec![(
-        SegmentKind::MwRender,
-        myr_wire::render(&Object::Task(task.clone())).map_err(crate::Error::from)?,
-    )];
+    // Model-facing rendering uses the mission's short references (step B2).
+    let mut rendered: serde_json::Value = serde_json::from_str(
+        &myr_wire::render(&Object::Task(task.clone())).map_err(crate::Error::from)?,
+    )
+    .map_err(crate::Error::from)?;
+    dispatcher.aliases_mut().view(&mut rendered, false);
+    let mut history = vec![(SegmentKind::MwRender, rendered.to_string())];
     history.extend(private_listing.map(|listing| (SegmentKind::DirectRepo, listing)));
     let mut objects = Vec::new();
     let mut cas_segments = Vec::new();
@@ -259,7 +262,9 @@ pub(crate) fn run_with(
             if !graph.live(task_ref).map_err(crate::Error::from)? {
                 return failure(graph, task_ref, &objects, FailCode::InvalidatedReference);
             }
-            let outcomes = match session.handle(graph, &completion.raw_output) {
+            // Resolve short references to full CIDs before any validation.
+            let resolved = dispatcher.aliases().resolve_raw(&completion.raw_output);
+            let outcomes = match session.handle(graph, &resolved) {
                 Ok(outcomes) => outcomes,
                 Err(error) => {
                     // Earlier actions of this response are already committed.
@@ -303,7 +308,7 @@ pub(crate) fn run_with(
                         }
                         // Classification by provenance; identical for single and
                         // batched fetches.
-                        let classify = |reference: ObjectRef| {
+                        let classify = |dispatcher: &Dispatcher, reference: ObjectRef| {
                             if reference == task.instruction {
                                 SegmentKind::Goal
                             } else if reference.kind == Kind::Artifact {
@@ -324,22 +329,44 @@ pub(crate) fn run_with(
                                 for ((reference, item), bytes) in
                                     references.into_iter().zip(items).zip(&fetched_items)
                                 {
+                                    let kind = classify(dispatcher, reference);
+                                    let mut item = item;
+                                    // Private source-view reads are shown unaliased,
+                                    // so aliases reveal nothing about which files differ.
                                     if bytes.is_some() {
                                         cas_segments.push(history.len());
+                                        // Runtime records (the sealed goal and
+                                        // referenced runtime artifacts) are aliased
+                                        // inside their text; other content is not.
+                                        let records = reference.kind == Kind::Goal
+                                            || kind == SegmentKind::CasReferenced;
+                                        dispatcher.aliases_mut().view(&mut item, records);
                                     }
-                                    history.push((classify(reference), item.to_string()));
+                                    history.push((kind, item.to_string()));
                                 }
                             }
                             action => {
-                                let kind = match action {
-                                    Action::Fetch { reference } => classify(reference),
-                                    _ => SegmentKind::LocalTool,
+                                let private = matches!(action, Action::Fetch { .. })
+                                    && fetched_raw_bytes.is_none();
+                                let (kind, records) = match action {
+                                    Action::Fetch { reference } => {
+                                        let kind = classify(dispatcher, reference);
+                                        (
+                                            kind,
+                                            reference.kind == Kind::Goal
+                                                || kind == SegmentKind::CasReferenced,
+                                        )
+                                    }
+                                    _ => (SegmentKind::LocalTool, false),
                                 };
                                 if fetched_raw_bytes.is_some() {
                                     cas_segments.push(history.len());
                                 }
-                                let receipt =
+                                let mut receipt =
                                     serde_json::json!({"objects":emitted,"result":result});
+                                if !private {
+                                    dispatcher.aliases_mut().view(&mut receipt, records);
+                                }
                                 history.push((
                                     kind,
                                     serde_json::to_string(&receipt).map_err(crate::Error::from)?,
@@ -348,6 +375,7 @@ pub(crate) fn run_with(
                         }
                     }
                     Outcome::Repair { attempt, message } => {
+                        let message = dispatcher.aliases_mut().view_text(&message);
                         history.push((
                             SegmentKind::ValidationFeedback,
                             serde_json::json!({"repair_attempt":attempt,"message":message})
@@ -675,11 +703,26 @@ mod tests {
         let mut calls = 0;
         let result = run_with(&mut graph, &mut dispatcher, execution, |_, request| {
             calls += 1;
-            if calls == 1 {
-                reply(r#"{"actions":[{"tool":"put_artifact","arguments":{"content_base64":"eA=="}}]}"#)
-            } else {
-                assert!(request.prompt.contains(&artifact.to_string()));
-                reply(r#"{"actions":[{"tool":"finish","arguments":{}}]}"#)
+            match calls {
+                1 => reply(
+                    r#"{"actions":[{"tool":"put_artifact","arguments":{"content_base64":"eA=="}}]}"#,
+                ),
+                2 => {
+                    // Step B2: the receipt names the artifact by a short alias,
+                    // never by its full CID.
+                    assert!(!request.prompt.contains(&artifact.to_string()));
+                    let start = request.prompt.rfind(r##""objects":[{"cid":"#"##).unwrap() + 19;
+                    let alias = &request.prompt[start..request.prompt[start..].find('"').unwrap() + start];
+                    assert!(alias.starts_with('#'));
+                    // The model reuses the alias; the runtime resolves it.
+                    reply(&format!(
+                        r#"{{"actions":[{{"tool":"fetch","arguments":{{"reference":{{"kind":"ARTIFACT","cid":"{alias}"}}}}}}]}}"#
+                    ))
+                }
+                _ => {
+                    assert!(request.prompt.contains(r#""content_text":"x""#));
+                    reply(r#"{"actions":[{"tool":"finish","arguments":{}}]}"#)
+                }
             }
         })
         .unwrap();
@@ -689,7 +732,7 @@ mod tests {
             result.objects,
             vec![ObjectRef::new(Kind::Artifact, artifact)]
         );
-        assert_eq!(dispatcher.attempts().len(), 2);
+        assert_eq!(dispatcher.attempts().len(), 3);
     }
     #[test]
     fn fetch_many_returns_single_fetch_items_with_per_item_classes() {

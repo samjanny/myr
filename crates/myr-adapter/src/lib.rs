@@ -1,4 +1,5 @@
 //! The common untrusted-output boundary for CLI and API transports.
+pub mod aliases;
 pub mod claude_code;
 pub mod codex_cli;
 pub mod config;

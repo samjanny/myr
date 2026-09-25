@@ -76,6 +76,38 @@ fn catalog_live(graph: &Graph, catalog: &Catalog) -> Result<bool, Error> {
 
 /// Executes the planner provider explicitly selected by runtime policy. The
 /// supplied dispatcher is not replaced or reset when planning finishes.
+/// One fetched item as the planner sees it, classified by provenance and
+/// rendered with the mission's short references.
+fn planner_item(
+    graph: &Graph,
+    dispatcher: &mut Dispatcher,
+    repository: &std::collections::BTreeSet<ObjectRef>,
+    reference: ObjectRef,
+    bytes: &[u8],
+) -> Result<(SegmentKind, String), Error> {
+    Ok(if reference.kind == Kind::Artifact {
+        let kind = dispatcher.classify_artifact(
+            "planner",
+            reference,
+            repository,
+            SegmentKind::CasReferenced,
+        );
+        let mut value = myr_adapter::render_artifact(reference, bytes);
+        dispatcher
+            .aliases_mut()
+            .view(&mut value, kind == SegmentKind::CasReferenced);
+        (kind, value.to_string())
+    } else {
+        let mut value: serde_json::Value = serde_json::from_str(
+            &myr_wire::render(&graph.get(reference).map_err(crate::Error::from)?)
+                .map_err(crate::Error::from)?,
+        )
+        .map_err(crate::Error::from)?;
+        dispatcher.aliases_mut().view(&mut value, false);
+        (SegmentKind::MwRender, value.to_string())
+    })
+}
+
 pub fn run(
     graph: &mut Graph,
     dispatcher: &mut Dispatcher,
@@ -137,10 +169,11 @@ pub(crate) fn run_with(
             SegmentKind::Goal,
             serde_json::to_string(mission).map_err(crate::Error::from)?,
         ),
-        (
-            SegmentKind::MwRender,
-            catalog.description(graph)?.to_string(),
-        ),
+        (SegmentKind::MwRender, {
+            let mut description = catalog.description(graph)?;
+            dispatcher.aliases_mut().view(&mut description, false);
+            description.to_string()
+        }),
     ];
     let mut created = vec![];
     let mut cas_segments = vec![];
@@ -230,7 +263,9 @@ pub(crate) fn run_with(
                 "Planner catalog became unavailable",
             );
         }
-        if matches!(catalog.access_allowed(&completion.raw_output), Ok(false)) {
+        // Resolve short references (step B2) before any check.
+        let resolved = dispatcher.aliases().resolve_raw(&completion.raw_output);
+        if matches!(catalog.access_allowed(&resolved), Ok(false)) {
             return failure(
                 graph,
                 created,
@@ -238,60 +273,29 @@ pub(crate) fn run_with(
                 "Planner attempted an out-of-catalog reference",
             );
         }
-        match catalog.handle_response(graph, mission, policy, &completion.raw_output) {
+        match catalog.handle_response(graph, mission, policy, &resolved) {
             Ok(Step::Created(reference)) => {
                 dispatcher.record_artifact_origin("planner", reference);
                 created.push(reference);
-                history.push((
-                    SegmentKind::LocalTool,
-                    serde_json::json!({"created":reference}).to_string(),
-                ));
+                history.push((SegmentKind::LocalTool, {
+                    let mut receipt = serde_json::json!({ "created": reference });
+                    dispatcher.aliases_mut().view(&mut receipt, false);
+                    receipt.to_string()
+                }));
             }
             Ok(Step::FetchedMany(items)) => {
                 for (reference, bytes) in items {
                     dispatcher.record_cas_read(bytes.len() as u64)?;
-                    let (kind, value) = if reference.kind == Kind::Artifact {
-                        (
-                            dispatcher.classify_artifact(
-                                "planner",
-                                reference,
-                                &repository,
-                                SegmentKind::CasReferenced,
-                            ),
-                            myr_adapter::render_artifact(reference, &bytes).to_string(),
-                        )
-                    } else {
-                        (
-                            SegmentKind::MwRender,
-                            myr_wire::render(&graph.get(reference).map_err(crate::Error::from)?)
-                                .map_err(crate::Error::from)?,
-                        )
-                    };
+                    let item = planner_item(graph, dispatcher, &repository, reference, &bytes)?;
                     cas_segments.push(history.len());
-                    history.push((kind, value));
+                    history.push(item);
                 }
             }
             Ok(Step::Fetched { reference, bytes }) => {
                 dispatcher.record_cas_read(bytes.len() as u64)?;
-                let (kind, value) = if reference.kind == Kind::Artifact {
-                    (
-                        dispatcher.classify_artifact(
-                            "planner",
-                            reference,
-                            &repository,
-                            SegmentKind::CasReferenced,
-                        ),
-                        myr_adapter::render_artifact(reference, &bytes).to_string(),
-                    )
-                } else {
-                    (
-                        SegmentKind::MwRender,
-                        myr_wire::render(&graph.get(reference).map_err(crate::Error::from)?)
-                            .map_err(crate::Error::from)?,
-                    )
-                };
+                let item = planner_item(graph, dispatcher, &repository, reference, &bytes)?;
                 cas_segments.push(history.len());
-                history.push((kind, value));
+                history.push(item);
             }
             Ok(Step::Sealed(goal)) => {
                 if started.elapsed() >= Duration::from_millis(policy.time_budget_ms) {
@@ -323,7 +327,8 @@ pub(crate) fn run_with(
                         "Planner exceeded two repair attempts",
                     );
                 }
-                history.push((SegmentKind::ValidationFeedback, format!("Invalid planner response: {error}. Return an action matching the current schema and mission constraints.")));
+                let message = dispatcher.aliases_mut().view_text(&error.to_string());
+                history.push((SegmentKind::ValidationFeedback, format!("Invalid planner response: {message}. Return an action matching the current schema and mission constraints.")));
             }
         }
     }
@@ -390,7 +395,9 @@ mod tests {
                         "arguments":[{"type":"ref","value":f.policy}]}}}))
                 }
                 3 => {
-                    assert!(request.prompt.contains(&f.atom.cid.to_string()));
+                    // Step B2: the new ATOM is named by a short alias.
+                    assert!(!request.prompt.contains(&f.atom.cid.to_string()));
+                    assert!(request.prompt.contains(r##""created":{"cid":"#"##));
                     // The schema no longer enumerates catalog CIDs (cost pilot B).
                     assert!(!request.schema.to_string().contains(&f.atom.cid.to_string()));
                     reply(serde_json::json!({"action":{"tool":"submit_goal","arguments":sealed.ir()}}))

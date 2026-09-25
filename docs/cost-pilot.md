@@ -203,3 +203,71 @@ Per-agent decomposition of MW/0 run 2 (communication tokens):
    Hexadecimal CIDs cost about 40 tokens each and dominate MW_RENDER, receipts
    and the reviewers' context. This change touches the protocol's text surface
    in both pipelines and needs an owner decision.
+
+### Step B2: short references in model-facing text (implemented, live runs pending)
+
+The specification leaves the text form of CIDs open ("text representation is
+not semantic"). Each mission run keeps one table, held by its dispatcher, that
+maps `#n` to full CIDs in first-appearance order:
+
+- **One table per mission.** Every agent of the run shares it, so `#7` names
+  the same object even when an agent quotes it in a message.
+- **Never in shared state.** Graph, storage, validation, reports and semantic
+  records always use full CIDs. The table is journaled only in the private
+  dispatch journal, so retained contexts can be audited.
+- **What is shortened.** Reference fields in MW renderings, receipts, catalog
+  listings and repository listings. Also full CIDs inside the text of runtime
+  records: the sealed goal and runtime artifacts such as candidate manifests,
+  review contexts and command records. Repair messages are shortened too.
+- **What is never rewritten.** Repository files and agent-authored artifacts.
+- **Private source view.** Its listing and reads stay unaliased. Otherwise
+  alias numbering, or a CID left in full, would hint which files differ
+  between the views.
+- **Resolution.** In every model response, reference-shaped objects are
+  resolved from `#n` to the full CID before any validation. Free text is never
+  resolved. `@k`, the reference to an earlier action of the same response,
+  stays distinct, and full CIDs remain accepted.
+
+Both pipelines use the same table mechanism and rendering rules.
+
+### State B2: short references (live)
+
+All runs used the host preflight (`--max-load-per-cpu 0.75`,
+`--min-available-memory-mib 4096`).
+
+| Pipeline | Run | Outcome | Responses | Comm tokens | Context tokens | Time |
+| --- | --- | --- | --- | --- | --- | --- |
+| MW/0 | 1 | COMPLETE | 14 | 20,802 | 29,821 | 134 s |
+| MW/0 | 2 | COMPLETE | 13 | 18,835 | 27,040 | 145 s |
+| Prose | 1 | COMPLETE | 7 | 584 | 6,250 | 40 s |
+| Prose | 2 | COMPLETE | 7 | 583 | 6,249 | 40 s |
+
+- **MW/0.** The median fell from 27,683 to 19,819 communication tokens (-28%).
+  MW_RENDER fell from about 14k to 7.3–7.9k and CAS_REFERENCED from about 5.4k
+  to 2.6–2.8k. PROTOCOL_SCHEMA (8.9–10.1k) is now the largest MW/0 component,
+  at 45–49%.
+- **Prose.** The median fell from 958 to 584 (-39%), because its candidate
+  listings also carried full CIDs. The ratio is about 34 times.
+
+### Summary across states (medians)
+
+| State | MW/0 comm tokens | MW/0 responses | Prose comm tokens | Ratio |
+| --- | --- | --- | --- | --- |
+| 0 | 110,617 | 40 | 2,616 | about 42 times |
+| A | 76,101 | 41.5 | 2,625 | about 29 times |
+| C | 50,386 | 20 | 1,993 | about 25 times |
+| C + B1 + C2 | 27,683 | 13 | 958 | about 29 times |
+| C + B1 + C2 + B2 | 19,819 | 13.5 | 584 | about 34 times |
+
+Implementation work removed 82% of MW/0's initial communication cost. Every
+step also served the prose baseline, since the tools are shared, and on this
+toy mission the ratio no longer improves. The remaining MW/0 cost is almost
+entirely fixed protocol cost:
+- schemas re-sent on every response (planner about 1.6k, worker about 1.1k,
+  reviewers about 0.2k);
+- typed renderings;
+- the reviewers' reads of runtime records.
+
+The toy mission cannot say whether that fixed cost amortizes as tasks grow.
+That question belongs to the second pilot, a scale curve with realistic
+artifacts.

@@ -77,7 +77,7 @@ fn record(properties: Value) -> Value {
 /// Access control never depends on the schema: the catalog checks every action.
 fn references(kind: Kind) -> Value {
     record(
-        json!({"kind":{"type":"string","enum":[kind]},"cid":{"type":"string","pattern":"^b3:[0-9a-f]{64}$"}}),
+        json!({"kind":{"type":"string","enum":[kind]},"cid":{"type":"string","pattern":"^(b3:[0-9a-f]{64}|#[1-9][0-9]*)$"}}),
     )
 }
 fn list(items: Value, empty_only: bool) -> Value {
